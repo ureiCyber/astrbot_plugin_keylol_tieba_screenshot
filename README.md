@@ -8,7 +8,7 @@
 
 <https://github.com/ureiCyber/astrbot_plugin_keylol_tieba_screenshot>
 
-维护者署名为 **キツネの嫁入り**（这是公开显示名，不是实名要求）；GitHub 账户名 `ureiCyber` 仅用于仓库地址和代码托管。插件内部标识仍为 `astrbot_plugin_keylol_screenshot`，用于保持已有配置和安装目录兼容。项目使用 MIT 许可证，详见仓库中的 [LICENSE](LICENSE) 文件。
+维护者署名为 **キツネの嫁入り**；GitHub 账户名 `ureiCyber` 仅用于仓库地址和代码托管。插件内部标识仍为 `astrbot_plugin_keylol_screenshot`，用于保持已有配置和安装目录兼容。项目使用 MIT 许可证，详见仓库中的 [LICENSE](LICENSE) 文件。
 
 ### 通过 AstrBot WebUI 安装或更新
 
