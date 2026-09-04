@@ -1,0 +1,40 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+.test-deps/
+*.tmp
+
+# Build and packaging artifacts
+build/
+dist/
+*.egg-info/
+*.whl
+*.tar.gz
+*.zip
+
+# Local runtime logs
+err.txt
+*.log
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+credentials.json
+credentials.yml
+credentials.yaml
+secrets.json
+secrets.yml
+secrets.yaml
+auth.json
+cookie.txt
+cookies.txt
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Locally generated screenshots (not reviewed for the initial release)
+sample-keylol-*.png

@@ -1,0 +1,116 @@
+{
+  "default_url": {
+    "type": "string",
+    "description": "未在指令中提供链接时使用的默认帖子",
+    "default": "https://keylol.com/t1046223-1-1"
+  },
+  "keylol_cookie": {
+    "type": "text",
+    "description": "可选：用于读取登录后附件的其乐 Cookie",
+    "hint": "公开帖子无需填写。Cookie 会以明文保存在 AstrBot 配置目录；请只在自己的 AstrBot WebUI 中填写，不要发到群聊、聊天记录或日志。",
+    "default": ""
+  },
+  "tieba_default_url": {
+    "type": "string",
+    "description": "未在 /tieba 指令中提供链接时使用的默认贴吧帖子",
+    "default": ""
+  },
+  "tieba_cookie": {
+    "type": "text",
+    "description": "百度贴吧登录 Cookie（必须包含 BDUSS）",
+    "hint": "Cookie 会以明文保存在 AstrBot 配置目录。推荐使用专用小号；不要发到群聊、聊天记录或日志。API 模式只提取 BDUSS 并提交给百度贴吧官方域名 c.tieba.baidu.com；浏览器模式只向 tieba.baidu.com 和 www.tieba.baidu.com 注入 BDUSS 及可选 STOKEN，绝不向图床或第三方域名发送。",
+    "default": ""
+  },
+  "auto_detect_enabled": {
+    "type": "bool",
+    "description": "自动检测群消息中的其乐和百度贴吧帖子链接或分享卡片",
+    "default": true
+  },
+  "max_links_per_message": {
+    "type": "int",
+    "description": "单条群消息最多自动处理的链接数量（1-3）",
+    "default": 1
+  },
+  "dedupe_seconds": {
+    "type": "int",
+    "description": "同一群内相同链接的防重复秒数",
+    "hint": "默认 60 秒；设为 0 可关闭防重复。",
+    "default": 60
+  },
+  "proxy_url": {
+    "type": "string",
+    "description": "可选：网页截图访问其乐和百度贴吧时使用的 HTTP/HTTPS 代理",
+    "hint": "示例：http://127.0.0.1:7890",
+    "default": ""
+  },
+  "keylol_render_engine": {
+    "type": "string",
+    "description": "其乐截图引擎",
+    "hint": "auto 优先使用受控浏览器网页截图，环境不可用时自动回退；playwright 强制网页截图并显示错误；html 始终使用原有清洗兼容模式。",
+    "options": ["auto", "playwright", "html"],
+    "default": "auto"
+  },
+  "tieba_render_engine": {
+    "type": "string",
+    "description": "百度贴吧截图引擎",
+    "hint": "auto 优先使用受控浏览器真实网页截图，环境不可用、验证码/反爬触发或页面 DOM 不兼容时自动回退安全 HTML；playwright 强制网页截图并显示错误；html 始终使用安全清洗兼容模式。",
+    "options": ["auto", "playwright", "html"],
+    "default": "auto"
+  },
+  "content_width": {
+    "type": "int",
+    "description": "其乐和百度贴吧网页截图宽度（CSS 像素，支持 320-440）",
+    "default": 390
+  },
+  "adaptive_height": {
+    "type": "bool",
+    "description": "根据实际内容自动裁掉截图底部空白",
+    "hint": "仅影响 html 兼容模式：移除短帖下方由默认视口产生的纯白区域；长帖保留完整内容。",
+    "default": true
+  },
+  "inline_keylol_images": {
+    "type": "bool",
+    "description": "兼容模式中下载并内嵌其乐正文图片",
+    "hint": "只影响 html 兼容模式和网页截图失败后的回退；网页截图模式由浏览器直接加载图片。",
+    "default": true
+  },
+  "inline_tieba_images": {
+    "type": "bool",
+    "description": "兼容模式中下载并内嵌百度贴吧主楼图片",
+    "hint": "只影响 html 兼容模式和网页截图失败后的回退；可避免图床防盗链，插件设有单图和总量限制。",
+    "default": true
+  },
+  "request_timeout_seconds": {
+    "type": "int",
+    "description": "网页请求超时秒数",
+    "default": 25
+  },
+  "render_timeout_ms": {
+    "type": "int",
+    "description": "AstrBot 图片渲染超时毫秒数",
+    "default": 30000
+  },
+  "browser_capture_timeout_ms": {
+    "type": "int",
+    "description": "其乐和百度贴吧网页截图最长等待毫秒数",
+    "hint": "包含页面打开、懒加载预热和截图；有效范围 15000-120000，长图建议保留默认值。",
+    "default": 120000
+  },
+  "split_toc_sections": {
+    "type": "bool",
+    "description": "目录帖子按目录项目拆分为多张网页截图",
+    "hint": "每个目录项目单独生成一张图；关闭后整篇帖子只生成一张图。仅影响其乐网页截图模式。",
+    "default": true
+  },
+  "max_toc_sections": {
+    "type": "int",
+    "description": "目录截图最多生成的图片数量（1-20）",
+    "hint": "超过上限时只处理前面的目录项目，避免超长帖子一次生成过多图片。",
+    "default": 12
+  },
+  "max_concurrency": {
+    "type": "int",
+    "description": "同时处理截图的最大数量（1-4）",
+    "default": 2
+  }
+}

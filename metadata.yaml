@@ -1,0 +1,16 @@
+name: astrbot_plugin_keylol_screenshot
+display_name: 其乐 / 贴吧主楼截图
+short_desc: 自动识别群消息中的其乐或百度贴吧链接并返回主楼截图。
+desc: |
+  配置对应登录 Cookie 后，自动识别群消息中的其乐 Keylol 帖子链接、百度贴吧链接
+  与 QQ 分享卡片，获取标题、作者、发布时间及完整主楼内容。其乐优先使用受控浏览器网页截图，
+  贴吧也优先使用受控浏览器真实网页截图，验证码、反爬或 DOM 不兼容等情况回退安全清洗后的 HTML；
+  目录分图仅适用于其乐，贴吧按主楼返回 PNG 图片。
+version: 0.5.0
+author: local-user
+astrbot_version: ">=4.0.0"
+tags:
+  - screenshot
+  - keylol
+  - tieba
+  - utility

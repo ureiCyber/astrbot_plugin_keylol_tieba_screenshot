@@ -1,0 +1,4 @@
+aiohttp>=3.9,<4
+beautifulsoup4>=4.12,<5
+Pillow>=11.2.1,<13
+playwright>=1.51,<2
