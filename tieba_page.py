@@ -27,13 +27,29 @@ _THREAD_LINK_RE = re.compile(
     re.IGNORECASE,
 )
 _URL_TRAILING_PUNCTUATION = ".,!?;:，。！？；：、)]}>"
-_IMAGE_HOST_SUFFIXES = (
-    ".baidu.com",
-    ".bdimg.com",
-    ".bdstatic.com",
-    ".bcebos.com",
-    ".ugcimg.cn",
-)
+# Keep this list in sync with ``tieba_browser.ALLOWED_TIEBA_STATIC_HOSTS``.
+# Post content is user-controlled, so image URLs must use an explicit
+# first-party allowlist before they are left in HTML or downloaded.
+_ALLOWED_IMAGE_HOSTS = {
+    "tieba.baidu.com",
+    "www.tieba.baidu.com",
+    "tb1.bdstatic.com",
+    "tb2.bdstatic.com",
+    "tb3.bdstatic.com",
+    "tb4.bdstatic.com",
+    "tb5.bdstatic.com",
+    "tb6.bdstatic.com",
+    "tbpic.bdimg.com",
+    "imgsrc.baidu.com",
+    "imgsa.baidu.com",
+    "img0.baidu.com",
+    "img1.baidu.com",
+    "img2.baidu.com",
+    "img3.baidu.com",
+    "tiebapic.baidu.com",
+    "himg.bdimg.com",
+    "bdstatic.com",
+}
 _MAX_PAGE_BYTES = 8 * 1024 * 1024
 _IMAGE_REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 _MAX_IMAGE_REDIRECTS = 5
@@ -196,6 +212,35 @@ def _absolute_http_url(value: str, base_url: str) -> str | None:
     return absolute
 
 
+def _safe_tieba_image_url(value: str, base_url: str) -> str | None:
+    """Resolve an image URL only when it is a first-party HTTPS asset.
+
+    This check is deliberately stricter than the generic link resolver.  A
+    post can contain arbitrary user-provided image URLs, and leaving one in
+    the rendered HTML would make the local renderer contact an external or
+    private host.
+    """
+
+    absolute = _absolute_http_url(value, base_url)
+    if not absolute:
+        return None
+    try:
+        parsed = urlparse(absolute)
+        port = parsed.port
+    except ValueError:
+        return None
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if (
+        parsed.scheme.lower() != "https"
+        or host not in _ALLOWED_IMAGE_HOSTS
+        or parsed.username
+        or parsed.password
+        or port is not None
+    ):
+        return None
+    return absolute
+
+
 def _decode_post_field(post: Tag) -> dict[str, Any]:
     raw = str(post.get("data-field", "")).strip()
     if not raw:
@@ -279,7 +324,7 @@ def _clean_main_post(content: Tag, source_url: str) -> str:
             else:
                 tag.attrs.pop("href", None)
         elif tag.name == "img":
-            src = _absolute_http_url(image_source, source_url)
+            src = _safe_tieba_image_url(image_source, source_url)
             if not src:
                 tag.decompose()
                 continue
@@ -405,7 +450,7 @@ def _api_fragment_html(fragment: Any) -> str:
         kind = 0
 
     if kind in {3, 20}:
-        source = _absolute_http_url(
+        source = _safe_tieba_image_url(
             str(
                 fragment.get("origin_src")
                 or fragment.get("big_cdn_src")
@@ -423,7 +468,7 @@ def _api_fragment_html(fragment: Any) -> str:
         )
 
     if kind == 5:
-        cover = _absolute_http_url(
+        cover = _safe_tieba_image_url(
             str(
                 fragment.get("origin_src")
                 or fragment.get("big_cdn_src")
@@ -547,14 +592,7 @@ def article_from_api(payload: Any, source_url: str) -> Article:
 
 
 def _is_tieba_image(url: str) -> bool:
-    try:
-        parsed = urlparse(url)
-    except ValueError:
-        return False
-    host = (parsed.hostname or "").lower().rstrip(".")
-    return parsed.scheme in {"http", "https"} and any(
-        host == suffix[1:] or host.endswith(suffix) for suffix in _IMAGE_HOST_SUFFIXES
-    )
+    return _safe_tieba_image_url(url, "https://tieba.baidu.com/") is not None
 
 
 def _is_tieba_page_url(url: str) -> bool:
@@ -631,11 +669,18 @@ async def _inline_tieba_images(
         cookie_jar=aiohttp.DummyCookieJar(),
     ) as session:
         for image in soup.find_all("img", src=True):
+            def mark_image_failed() -> None:
+                if image.parent is not None:
+                    image.replace_with("[图片未加载]")
+
             source = str(image.get("src", ""))
-            if not _is_tieba_image(source):
+            current_url = _safe_tieba_image_url(source, article.source_url)
+            if not current_url:
+                # Never leave arbitrary post-controlled URLs for the HTML
+                # renderer to fetch later (including localhost/private hosts).
+                image.decompose()
                 continue
             try:
-                current_url = source
                 # A credential-bearing request is only allowed to remain on
                 # the exact HTTPS Tieba page hosts.  Once a redirect leaves
                 # them (including for a trusted image host), credentials stay
@@ -644,7 +689,8 @@ async def _inline_tieba_images(
                     current_url
                 )
                 for _ in range(_MAX_IMAGE_REDIRECTS + 1):
-                    if not _is_tieba_image(current_url):
+                    if not _safe_tieba_image_url(current_url, article.source_url):
+                        image.decompose()
                         break
                     request_headers = dict(headers)
                     if credentials_allowed:
@@ -657,25 +703,14 @@ async def _inline_tieba_images(
                     ) as response:
                         if response.status in _IMAGE_REDIRECT_STATUSES:
                             location = response.headers.get("Location", "")
-                            redirected_url = _absolute_http_url(
+                            redirected_url = _safe_tieba_image_url(
                                 location, current_url
                             )
-                            if not redirected_url or not _is_tieba_image(
-                                redirected_url
-                            ):
-                                break
-                            try:
-                                current_scheme = urlparse(current_url).scheme
-                                redirected_scheme = urlparse(redirected_url).scheme
-                            except ValueError:
-                                break
-                            # Never follow an HTTPS-to-HTTP downgrade.  This
-                            # also guarantees that no cookie-bearing request
-                            # can be downgraded to cleartext.
-                            if (
-                                current_scheme == "https"
-                                and redirected_scheme == "http"
-                            ):
+                            if not redirected_url:
+                                # Do not leave the original URL as a fallback:
+                                # its browser-side redirect could contact the
+                                # untrusted destination after this function.
+                                image.decompose()
                                 break
                             credentials_allowed = (
                                 credentials_allowed
@@ -685,6 +720,7 @@ async def _inline_tieba_images(
                             continue
 
                         if response.status != 200:
+                            mark_image_failed()
                             break
                         content_type = response.headers.get("Content-Type", "").split(
                             ";", 1
@@ -696,19 +732,27 @@ async def _inline_tieba_images(
                             "image/png",
                             "image/webp",
                         }:
+                            mark_image_failed()
                             break
                         try:
                             payload = await _read_limited(response, max_image_bytes)
                         except TiebaPageError:
+                            mark_image_failed()
                             break
                         if total + len(payload) > max_total_bytes:
+                            mark_image_failed()
                             break
                         total += len(payload)
                         encoded = base64.b64encode(payload).decode("ascii")
                         image["src"] = f"data:{content_type};base64,{encoded}"
                         break
+                else:
+                    # Exhausting the redirect budget must not leave a URL for
+                    # a later renderer to follow.
+                    mark_image_failed()
             except (aiohttp.ClientError, asyncio.TimeoutError):
-                continue
+                if image.parent is not None:
+                    mark_image_failed()
 
     return replace(article, body_html=str(soup))
 

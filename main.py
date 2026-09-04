@@ -523,7 +523,10 @@ class KeylolScreenshotPlugin(Star):
 
     @filter.command("keylol_check")
     async def keylol_check(self, event: AstrMessageEvent):
-        """验证插件配置中的其乐 Cookie 是否有效。"""
+        """仅允许 AstrBot 管理员在私聊中验证其乐 Cookie。"""
+        if not event.is_admin() or not event.is_private_chat():
+            yield event.plain_result("Cookie 验证仅限 AstrBot 管理员在私聊中执行。")
+            return
         cookie = self._cookie()
         if not cookie:
             yield event.plain_result("尚未配置 keylol_cookie。")
@@ -575,7 +578,10 @@ class KeylolScreenshotPlugin(Star):
 
     @filter.command("tieba_check")
     async def tieba_check(self, event: AstrMessageEvent):
-        """验证插件配置中的百度贴吧 Cookie 是否有效。"""
+        """仅允许 AstrBot 管理员在私聊中验证百度贴吧 Cookie。"""
+        if not event.is_admin() or not event.is_private_chat():
+            yield event.plain_result("Cookie 验证仅限 AstrBot 管理员在私聊中执行。")
+            return
         cookie = self._tieba_cookie()
         if not cookie:
             yield event.plain_result("尚未配置 tieba_cookie。")

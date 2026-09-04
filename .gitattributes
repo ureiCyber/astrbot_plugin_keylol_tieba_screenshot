@@ -1,0 +1,15 @@
+* text=auto
+.gitignore text eol=lf
+.gitattributes text eol=lf
+*.py text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+LICENSE text eol=lf
+
+# These files remain in Git, but are not needed in plugin source archives.
+/.github export-ignore
+/tests export-ignore
+/.gitignore export-ignore
+/.gitattributes export-ignore

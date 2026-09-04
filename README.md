@@ -2,6 +2,44 @@
 
 自动检测群消息中的其乐 Keylol 或百度贴吧帖子链接，并返回适合手机阅读的 PNG 图片。两站默认都优先使用本地受控浏览器直接截取真实移动网页，环境不可用时自动回退到安全清洗后的 HTML；贴吧同时支持 OneBot/NapCat 上报的 QQ JSON 分享卡片。
 
+## 公开仓库、安装与更新
+
+本插件现按链接公开分发，仓库地址为：
+
+<https://github.com/ureiCyber/astrbot_plugin_keylol_tieba_screenshot>
+
+维护者署名为 **キツネの嫁入り**（这是公开显示名，不是实名要求）；GitHub 账户名 `ureiCyber` 仅用于仓库地址和代码托管。插件内部标识仍为 `astrbot_plugin_keylol_screenshot`，用于保持已有配置和安装目录兼容。项目使用 MIT 许可证，详见仓库中的 [LICENSE](LICENSE) 文件。
+
+### 通过 AstrBot WebUI 安装或更新
+
+在 AstrBot WebUI 的插件管理中使用“＋”或安装入口，粘贴上面的 GitHub 仓库链接即可安装；之后在同一插件的更新入口检查并拉取新版本。公开仓库不需要在运行 AstrBot 的电脑上登录 GitHub。AstrBot 官方文档说明了通过 URL 或文件安装插件的方式：<https://docs.astrbot.app/use/webui.html>
+
+AstrBot 本体用 `uv` 安装，与插件安装和更新是两件不同的事：升级 AstrBot 本体不会自动升级本插件，插件更新也不会替换 AstrBot 本体。网页截图所需的 Playwright 浏览器依赖必须安装在运行该 AstrBot 实例的对应 Python 环境中；不要只在系统 Python 或另一套虚拟环境中安装。浏览器依赖的安装说明见下方“其乐 iPhone 网页截图与目录分图”章节。
+
+从 0.5.0 或旧 ZIP 手动安装的实例可能没有 `repo` 更新来源。首次切换到链接更新前，请先备份 AstrBot 配置；然后在已安装插件目录的 `metadata.yaml` 中补入下面这一行，再保存并重载插件：
+
+```yaml
+repo: https://github.com/ureiCyber/astrbot_plugin_keylol_tieba_screenshot
+```
+
+重载只会重新加载当前磁盘上的插件代码，不会下载更新；补入 `repo` 后再使用 WebUI 的更新入口。不要直接上传同名 ZIP 覆盖现有插件目录，也不要默认卸载插件来“更新”，以免造成不必要的配置迁移或丢失。若更新失败，保留配置备份并检查网络、仓库地址和 AstrBot 日志。
+
+### 0.5.1 变更摘要
+
+- 公开 GitHub 仓库并接入 `repo` 更新入口，便于从 AstrBot WebUI 按链接安装和后续更新。
+- 保留插件内部标识 `astrbot_plugin_keylol_screenshot`，避免已有配置和安装目录迁移。
+- 补充公开分发、许可证、更新流程及 Cookie 安全说明。
+- 收紧贴吧兼容模式图片来源，避免下载失败回退时访问任意外站或内网图片。
+- `/keylol_check` 与 `/tieba_check` 仅允许 AstrBot 管理员账号私聊验证；被拒绝时不会读取 Cookie 或发起网络请求。
+
+本项目暂不上架 AstrBot 插件市场，用户可通过 GitHub 仓库链接安装；后续版本继续在该仓库发布。
+
+### 公开分发与隐私安全
+
+- 每位用户都应只在自己信任的 AstrBot 本地 WebUI 中填写 `keylol_cookie` 和 `tieba_cookie`；不要把 Cookie、`BDUSS`、`STOKEN` 或配置文件发到 GitHub Issue、聊天、群组或公开日志中。
+- Cookie 是登录凭证。请优先使用权限受限的专用账号，怀疑泄露时立即退出对应账号会话或修改密码，使旧凭证失效。
+- Cookie 可访问的受限帖子或附件，可能会被插件截图并转发到你配置的群。请谨慎设置群范围、账号权限和可访问内容；公开仓库本身不会收集或替你托管这些 Cookie。
+
 ## 使用
 
 把本目录放进 AstrBot 的 `data/plugins/astrbot_plugin_keylol_screenshot/`，然后在 WebUI 中重载插件。
@@ -72,7 +110,7 @@ python -m playwright install chromium
 /keylol
 ```
 
-验证 Cookie 是否有效：
+验证 Cookie 是否有效（必须使用 AstrBot 管理员账号私聊发送；群管理员身份不会自动获得 AstrBot 管理员权限）：
 
 ```text
 /keylol_check
@@ -98,7 +136,7 @@ python -m playwright install chromium
 5. 选择 **Copy（复制）→ Copy as cURL (bash)**，粘贴到本地记事本。
 6. 找到 `-b '...'`，或 `-H 'cookie: ...'`。只复制引号内的完整 Cookie 值，粘贴到 AstrBot WebUI 的本插件配置 `keylol_cookie` 中并保存。
 7. 如果复制出的 cURL 中仍没有 `-b` 或 `cookie:`，说明这次请求没有携带登录 Cookie；重新登录其乐后再刷新一次。
-8. 在私聊中发送 `/keylol_check`。验证成功后再使用 `/keylol`。
+8. 使用 AstrBot 管理员账号私聊发送 `/keylol_check`。验证成功后再使用 `/keylol`。群管理员身份不会自动获得此权限。
 
 Cookie 相当于登录凭证。不要把它发给其他人，也不要提交到 GitHub。
 
@@ -116,7 +154,7 @@ Cookie 相当于登录凭证。不要把它发给其他人，也不要提交到 
 6. 如果标头面板没有直接显示 Cookie，可右键该请求，选择 **Copy → Copy as cURL (bash)**，粘贴到本地记事本，然后复制 `-b '...'` 或 `-H 'cookie: ...'` 引号内的内容。
 7. 确认复制内容中至少存在 `BDUSS=...`。如同时存在 `STOKEN=...`，一并保留。
 8. 把完整 Cookie 粘贴到 AstrBot WebUI 的本插件配置 `tieba_cookie`，保存并重载插件。
-9. 在与 Bot 的私聊中发送 `/tieba_check`；显示当前贴吧账号后，再在群里发送链接或 QQ 分享卡片测试。
+9. 使用 AstrBot 管理员账号私聊发送 `/tieba_check`；显示当前贴吧账号后，再在群里发送链接或 QQ 分享卡片测试。群管理员身份不会自动获得此权限。
 
 `BDUSS` 是高权限且可能长期有效的登录凭证。不要把 Cookie 发到群聊、Issue、日志或代码仓库；不要使用主账号；怀疑泄露时应立即退出该百度账号的登录会话或修改密码，使旧凭证失效。
 

@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 from tieba_page import (
     Article,
+    _ALLOWED_IMAGE_HOSTS,
     _MAX_IMAGE_REDIRECTS,
     _inline_tieba_images,
     TiebaPageError,
@@ -15,6 +16,7 @@ from tieba_page import (
     parse_tieba_article,
     parse_tieba_cookie,
 )
+from tieba_browser import ALLOWED_TIEBA_IMAGE_HOSTS
 
 
 class _FakeContent:
@@ -146,6 +148,9 @@ API_SAMPLE = {
 
 
 class TiebaPageTests(unittest.TestCase):
+    def test_html_and_browser_renderers_share_the_same_image_allowlist(self):
+        self.assertEqual(_ALLOWED_IMAGE_HOSTS, ALLOWED_TIEBA_IMAGE_HOSTS)
+
     def test_normalizes_share_url_to_canonical_thread_url(self):
         self.assertEqual(
             normalize_tieba_url(
@@ -266,6 +271,59 @@ class TiebaPageTests(unittest.TestCase):
         self.assertNotIn("onerror", article.body_html)
         self.assertNotIn("<script", article.body_html)
 
+    def test_html_sanitizer_drops_external_private_and_lookalike_images(self):
+        unsafe_urls = (
+            "https://example.com/track.png",
+            "http://127.0.0.1/private.png",
+            "http://192.168.1.10/private.png",
+            "https://localhost/private.png",
+            "https://imgsa.baidu.com.evil.example/fake.png",
+            "https://user:pass@imgsa.baidu.com/private.png",
+            "https://imgsa.baidu.com:8443/private.png",
+        )
+        for unsafe_url in unsafe_urls:
+            with self.subTest(unsafe_url=unsafe_url):
+                page = f"""
+                <div class="l_post" data-field='{{"content":{{"post_no":1}}}}'>
+                  <div class="j_d_post_content">正文<img src="{unsafe_url}"></div>
+                  <div class="post-tail-wrap"><span class="tail-info">1楼</span></div>
+                </div>
+                """
+                article = parse_tieba_article(
+                    page, "https://tieba.baidu.com/p/123"
+                )
+                self.assertNotIn(unsafe_url, article.body_html)
+                self.assertNotIn("<img", article.body_html)
+
+    def test_api_fragments_drop_external_private_and_lookalike_images(self):
+        unsafe_urls = (
+            "https://example.com/track.png",
+            "http://127.0.0.1/private.png",
+            "https://imgsa.baidu.com.evil.example/fake.png",
+            "https://user:pass@imgsa.baidu.com/private.png",
+            "https://imgsa.baidu.com:8443/private.png",
+        )
+        for unsafe_url in unsafe_urls:
+            with self.subTest(unsafe_url=unsafe_url):
+                payload = {
+                    "error_code": 0,
+                    "thread": {"title": "安全测试"},
+                    "post_list": [
+                        {
+                            "floor": 1,
+                            "content": [
+                                {"type": 0, "text": "正文"},
+                                {"type": 3, "src": unsafe_url},
+                            ],
+                        }
+                    ],
+                }
+                article = article_from_api(
+                    payload, "https://tieba.baidu.com/p/123"
+                )
+                self.assertNotIn(unsafe_url, article.body_html)
+                self.assertNotIn("<img", article.body_html)
+
     def test_falls_back_to_tail_marker_when_data_field_is_missing(self):
         page = """
         <h3 class="core_title_txt">旧版页面</h3>
@@ -364,6 +422,43 @@ class TiebaPageTests(unittest.TestCase):
 
         self.assertEqual(len(session.requests), 1)
         self.assertNotIn("data:image/", result.body_html)
+        self.assertNotIn("tieba.baidu.com/image.png", result.body_html)
+        self.assertNotIn("example.com/private.png", result.body_html)
+
+    def test_keeps_safe_placeholder_when_allowed_image_download_fails(self):
+        session = _FakeSession([_FakeResponse(503)])
+        with patch("tieba_page.aiohttp.ClientSession", return_value=session):
+            result = asyncio.run(
+                _inline_tieba_images(
+                    _image_article("https://imgsa.baidu.com/start.png"),
+                    cookie="BDUSS=secret; STOKEN=token",
+                    timeout_seconds=5,
+                )
+            )
+        self.assertIn("[图片未加载]", result.body_html)
+        self.assertNotIn("<img", result.body_html)
+
+    def test_removes_untrusted_image_before_inline_download(self):
+        unsafe_urls = (
+            "https://example.com/track.png",
+            "http://127.0.0.1/private.png",
+            "https://imgsa.baidu.com.evil.example/fake.png",
+            "https://imgsa.baidu.com:8443/private.png",
+        )
+        for unsafe_url in unsafe_urls:
+            with self.subTest(unsafe_url=unsafe_url):
+                session = _FakeSession([])
+                with patch("tieba_page.aiohttp.ClientSession", return_value=session):
+                    result = asyncio.run(
+                        _inline_tieba_images(
+                            _image_article(unsafe_url),
+                            cookie="BDUSS=secret; STOKEN=token",
+                            timeout_seconds=5,
+                        )
+                    )
+                self.assertEqual(session.requests, [])
+                self.assertNotIn(unsafe_url, result.body_html)
+                self.assertNotIn("<img", result.body_html)
 
     def test_stops_redirect_loop_at_maximum(self):
         session = _FakeSession(
