@@ -22,6 +22,13 @@ from urllib.parse import parse_qsl, urlencode, urlparse
 
 from PIL import Image
 
+try:
+    from .safe_media import SafeMediaDownloader, is_public_https_url
+    from .keylol_embeds import render_embed
+except ImportError:  # Direct execution from the plugin directory.
+    from safe_media import SafeMediaDownloader, is_public_https_url
+    from keylol_embeds import render_embed
+
 try:  # Optional dependency.  The existing non-browser renderer must continue to work without it.
     from playwright.async_api import async_playwright
 except ImportError:  # pragma: no cover - exercised only in installations without Playwright.
@@ -84,6 +91,12 @@ class KeylolBrowserCaptureResult:
     status: KeylolBrowserCaptureStatus
     image_paths: tuple[str, ...] = ()
     section_titles: tuple[str, ...] = ()
+    external_image_count: int = 0
+    failed_external_image_count: int = 0
+    embed_count: int = 0
+    loaded_embed_count: int = 0
+    fallback_embed_count: int = 0
+    auto_expanded_collapse_count: int = 0
 
 
 def normalize_keylol_browser_url(raw_url: str) -> str:
@@ -424,13 +437,29 @@ async ({sourceUrl, viewportWidth, suppliedTitle, suppliedAuthor, suppliedPublish
     if (!value || /^javascript:/i.test(value)) return "";
     try {
       const url = new URL(String(value).trim(), location.href);
-      return url.protocol === "https:" && allowedHost(url.hostname) && !url.username && !url.password && !url.port ? url.href : "";
+      // External candidates are intercepted and fulfilled by the Python
+      // downloader. This does not grant browser network access to their host.
+      return url.protocol === "https:" && !url.username && !url.password && !url.port ? url.href : "";
     } catch (_) { return ""; }
   };
   const article = document.querySelector("article.plc");
   const content = article && article.querySelector(".message");
   if (!article || !content) throw new Error("NO_FIRST_POST");
+  const sourceImageCount = content.querySelectorAll('img').length;
   article.dataset.keylolCaptureArticle = "1";
+  const permissionSelector = '.showhide, .attach_nopermission, .spoiler, .showhidecontent, .hidecontent, .replyhide, .locked, .login-required, [data-spoiler], [data-permission]';
+  const permissionText = /回复后|回复可见|需要回复|回复.{0,8}(?:可见|查看)|偷看一眼|偷看一下|权限不足|登录后|登陆后/;
+  let autoExpandedCollapseCount = 0;
+  // Mark access-controlled structures before removing event handlers. Never
+  // click a toggle: the ordinary sff box is entirely controlled by its class.
+  for (const box of content.querySelectorAll('.sff_collapse.sff_collapsed')) {
+    const parentBlocked = box.parentElement && box.parentElement.closest('.sff_collapsed, ' + permissionSelector);
+    const ordinary = box.querySelector(':scope > .sff_collapse_b') && box.querySelector(':scope > .sff_collapse_d');
+    if (!ordinary || parentBlocked || box.matches(permissionSelector) || box.querySelector(permissionSelector) || permissionText.test(text(box))) continue;
+    box.classList.remove('sff_collapsed');
+    autoExpandedCollapseCount++;
+  }
+  const resourceHidden = (node) => Boolean(node.closest(permissionSelector + ', .sff_collapsed'));
   for (const node of document.querySelectorAll("article.plc")) if (node !== article) node.style.display = "none";
   if (hideToc) for (const node of document.querySelectorAll("#threadindex, .tindex")) node.style.display = "none";
   for (const node of document.querySelectorAll(".pgs, .rnd_ai_pr, .a_mu, .pstatus, .jammer, form, script, noscript")) node.remove();
@@ -464,11 +493,21 @@ async ({sourceUrl, viewportWidth, suppliedTitle, suppliedAuthor, suppliedPublish
     .keylol-browser-image-failed { border-color: #efd4d4; background: #fff7f7; color: #9a3b3b; }
   `;
   const previousStyle = document.getElementById("keylol-browser-capture-style"); if (previousStyle) previousStyle.remove(); document.head.append(style);
-  const mediaCard = (kind, label) => { const card = document.createElement("div"); card.className = `keylol-browser-media-card keylol-browser-media-${kind}`; card.textContent = `${kind === "video" ? "视频内容" : "音频内容"}${label ? ` · ${label.slice(0, 120)}` : ""}（静态截图无法播放）`; return card; };
-  for (const media of [...article.querySelectorAll("iframe, embed, object")]) media.replaceWith(mediaCard("video", media.getAttribute("title") || ""));
-  let imageCount = 0, missingImageCount = 0;
+  const embeds = [];
+  for (const media of [...content.querySelectorAll("iframe, embed, object")]) {
+    if (resourceHidden(media)) continue;
+    const card = document.createElement('div');
+    card.className = 'keylol-browser-media-card';
+    card.dataset.keylolEmbed = String(embeds.length);
+    card.textContent = '外部嵌入内容（静态截图无法完整加载）';
+    embeds.push({index: embeds.length, url: absolute(media.getAttribute('src') || media.getAttribute('data') || '')});
+    media.replaceWith(card);
+  }
+  let imageCount = 0, missingImageCount = 0, externalImageCount = 0, missingExternalImageCount = 0;
+  const externalSources = [];
   const missingImageCard = (label) => { const card = document.createElement("div"); card.className = "keylol-browser-media-card keylol-browser-image-failed"; card.textContent = `图片地址不可用${label ? ` · ${label.slice(0, 120)}` : ""}`; return card; };
   for (const image of [...content.querySelectorAll("img")]) {
+    if (resourceHidden(image)) { image.dataset.keylolCaptureHidden = "1"; continue; }
     if (image.dataset.keylolLoaded === "1" || image.dataset.keylolCandidates) { image.loading = "eager"; continue; }
     const values = [];
     const nearby = image.closest(".pattl, .attachlist, dl.tattl, .ignore_js_op");
@@ -476,9 +515,12 @@ async ({sourceUrl, viewportWidth, suppliedTitle, suppliedAuthor, suppliedPublish
     if (nearby) for (const a of nearby.querySelectorAll('a[href*="mod=attachment"]')) values.push(a.getAttribute("href"));
     const srcset = image.getAttribute("srcset") || image.getAttribute("data-srcset") || "";
     for (const value of srcset.split(",").map((item) => item.trim().split(/\s+/)[0]).reverse()) if (value) values.push(value);
+    const external = values.some((value) => { try { const url = new URL(value, location.href); return /^https?:$/.test(url.protocol) && !allowedHost(url.hostname); } catch (_) { return false; } });
+    if (external) { image.dataset.keylolExternal = "1"; externalImageCount++; }
     const candidates = []; for (const value of values) { if (badImage.test(value)) continue; const candidate = absolute(value); if (candidate && !candidates.includes(candidate)) candidates.push(candidate); }
+    for (const candidate of candidates) if (!allowedHost(new URL(candidate).hostname)) externalSources.push(candidate);
     const current = absolute(image.currentSrc || image.src || "");
-    if (current && !badImage.test(current) && image.complete && image.naturalWidth > 1) {
+    if (current && current === candidates[0] && !badImage.test(current) && image.complete && image.naturalWidth > 1) {
       image.dataset.keylolLoaded = "1";
       image.loading = "eager";
       imageCount++;
@@ -486,12 +528,12 @@ async ({sourceUrl, viewportWidth, suppliedTitle, suppliedAuthor, suppliedPublish
     }
     if (!candidates.length) {
       if (values.some((value) => badImage.test(value))) image.remove();
-      else { image.replaceWith(missingImageCard(image.alt || "")); missingImageCount++; }
+      else { image.replaceWith(missingImageCard(image.alt || "")); missingImageCount++; if (external) missingExternalImageCount++; }
       continue;
     }
     image.dataset.keylolCandidates = JSON.stringify(candidates); image.dataset.keylolPending = "1"; image.src = placeholder; image.removeAttribute("srcset"); image.removeAttribute("data-srcset"); for (const attr of imageAttrs) if (attr !== "src") image.removeAttribute(attr); image.loading = "eager"; image.decoding = "async"; image.referrerPolicy = "strict-origin-when-cross-origin"; imageCount++;
   }
-  return {title, imageCount, missingImageCount, nodeCount: article.querySelectorAll("*").length};
+  return {title, imageCount, sourceImageCount, missingImageCount, externalImageCount, missingExternalImageCount, externalSources, embeds, autoExpandedCollapseCount, nodeCount: article.querySelectorAll("*").length};
 }
 """
 
@@ -604,10 +646,12 @@ _FINALIZE_IMAGES_SCRIPT = r"""
 () => {
   const article = document.querySelector('article[data-keylol-capture-article="1"]');
   const root = article && article.querySelector('.message') || article || document;
-  let failed = 0;
+  let failed = 0, failedExternal = 0;
   for (const image of [...root.querySelectorAll("img")]) {
-    if (image.complete && image.naturalWidth > 0) continue;
+    if (image.dataset.keylolCaptureHidden === "1") continue;
+    if (!image.dataset.keylolFailed && !image.dataset.keylolPending && !image.dataset.keylolCandidates && image.complete && image.naturalWidth > 0) continue;
     failed++;
+    if (image.dataset.keylolExternal === "1") failedExternal++;
     const card = document.createElement("div");
     card.className = "keylol-browser-media-card keylol-browser-image-failed";
     const strong = document.createElement("strong");
@@ -623,6 +667,7 @@ _FINALIZE_IMAGES_SCRIPT = r"""
       image.dataset.keylolLoaded === "1" && image.complete && image.naturalWidth > 0
     ).length,
     failed,
+    failedExternal,
     ...(() => {
       const footer = article && article.querySelector('.keylol-capture-footer');
       const footerBottom = footer ? Math.ceil(footer.getBoundingClientRect().bottom + window.scrollY + 8) : 0;
@@ -670,6 +715,35 @@ _RESTORE_REPEATED_CHROME_SCRIPT = r"""
   window.scrollTo(0, 0);
 }
 """
+
+
+_INSTALL_EMBED_SCRIPT = r"""
+async ({index, html}) => {
+  const target = document.querySelector(`[data-keylol-embed="${index}"]`);
+  if (!target) return false;
+  // HTML comes only from our provider renderer, never directly from a page.
+  target.innerHTML = html;
+  const images = [...target.querySelectorAll('img')];
+  for (const image of images) image.dataset.keylolEmbedImage = '1';
+  return (await Promise.all(images.map((image) => image.decode().then(() => true, () => false)))).every(Boolean);
+}
+"""
+
+
+async def _fulfill_external_image(
+    route: object, downloader: SafeMediaDownloader, url: str
+) -> None:
+    """Do not reuse browser headers, cookies, proxy settings or credentials."""
+    result = await downloader.fetch_image(url)
+    if result is None:
+        await route.abort(error_code="blockedbyclient")  # type: ignore[attr-defined]
+        return
+    await route.fulfill(  # type: ignore[attr-defined]
+        status=200,
+        body=result.data,
+        content_type=result.content_type,
+        headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+    )
 
 
 async def _capture_mobile_page_tiles(
@@ -781,6 +855,7 @@ async def capture_keylol_webpage_screenshot(
     allocated_paths: list[str] = []
 
     playwright = browser = context = page = None
+    media_downloader = SafeMediaDownloader()
     try:
         playwright = await async_playwright().start()
         launch_kwargs: dict[str, object] = {"headless": True}
@@ -841,6 +916,7 @@ async def capture_keylol_webpage_screenshot(
         if expected_thread_id is None:
             raise KeylolBrowserUrlError("仅支持其乐帖子的第一页链接。")
         allowed_toc_sections: set[tuple[str, str]] = set()
+        external_sources: set[str] = set()
 
         async def _route(route: object, request: object) -> None:
             request_url = str(getattr(request, "url", ""))
@@ -867,6 +943,16 @@ async def capture_keylol_webpage_screenshot(
             allowed_image = resource_type == "image" and _is_allowed_image_request(
                 request_url
             )
+            if (
+                method == "GET"
+                and resource_type == "image"
+                and request_frame == page.main_frame
+                and not allowed_image
+                and request_url in external_sources
+                and is_public_https_url(request_url)
+            ):
+                await _fulfill_external_image(route, media_downloader, request_url)
+                return
             allowed_toc = False
             if method == "GET" and resource_type in {"xhr", "fetch"}:
                 try:
@@ -925,10 +1011,13 @@ async def capture_keylol_webpage_screenshot(
         )
 
         image_total = loaded_total = failed_total = 0
+        external_total = failed_external_total = 0
+        embed_total = loaded_embed_total = fallback_embed_total = expanded_total = 0
         total_pixels = 0
         capture_title = "其乐帖子"
         final_status = KeylolBrowserCaptureStatus.OK
         for section_index, section in enumerate(sections):
+            external_sources.clear()
             if int(section.get("index", -1)) >= 0:
                 cp, viewpid = str(section["cp"]), str(section["viewpid"])
                 try:
@@ -965,8 +1054,24 @@ async def capture_keylol_webpage_screenshot(
                 )
             except Exception as exc:
                 raise KeylolBrowserNavigationError("页面未找到可截图的 1 楼正文；请确认 Cookie 有效。") from exc
-            if int(info.get("imageCount", 0)) > MAX_BROWSER_IMAGE_COUNT or int(info.get("nodeCount", 0)) > MAX_BROWSER_DOM_NODES:
+            if max(int(info.get("sourceImageCount", 0)), int(info.get("imageCount", 0))) > MAX_BROWSER_IMAGE_COUNT or int(info.get("nodeCount", 0)) > MAX_BROWSER_DOM_NODES:
                 raise KeylolBrowserNavigationError("帖子内容过大，已停止网页截图。")
+            external_sources.update(
+                value for value in info.get("externalSources", [])
+                if isinstance(value, str) and is_public_https_url(value)
+            )
+            embeds = info.get("embeds", [])
+            loaded_embeds = 0
+            for embed_index, embed in enumerate(embeds):
+                # Bound provider work even for posts with thousands of frames.
+                embed_url = str(embed.get("url", ""))
+                result = await render_embed(embed_url, media_downloader, fetch=embed_index < 20)
+                installed = await page.evaluate(_INSTALL_EMBED_SCRIPT, {"index": int(embed["index"]), "html": result.html})
+                loaded_embeds += int(result.loaded and installed)
+            embed_total += len(embeds)
+            loaded_embed_total += loaded_embeds
+            fallback_embed_total += len(embeds) - loaded_embeds
+            expanded_total += int(info.get("autoExpandedCollapseCount", 0))
             try:
                 scroll_state = await page.evaluate(
                     _SCROLL_SCRIPT,
@@ -1006,13 +1111,15 @@ async def capture_keylol_webpage_screenshot(
             except Exception as exc:
                 raise KeylolBrowserTimeoutError("生成网页截图超时或失败，请稍后重试。") from exc
             screenshot_paths.append(current_path)
-            image_count = int(info.get("imageCount", 0))
+            image_count = int(info.get("imageCount", 0)) + int(info.get("missingImageCount", 0))
             loaded = int(stats.get("loaded", 0))
             failed = int(stats.get("failed", 0)) + int(info.get("missingImageCount", 0))
             image_total += image_count
             loaded_total += loaded
             failed_total += failed
-            if failed or loaded < image_count:
+            external_total += int(info.get("externalImageCount", 0))
+            failed_external_total += int(info.get("missingExternalImageCount", 0)) + int(stats.get("failedExternal", 0))
+            if failed or loaded < image_count or loaded_embeds < len(embeds):
                 final_status = KeylolBrowserCaptureStatus.PARTIAL
             capture_title = str(info.get("title", capture_title))
         return KeylolBrowserCaptureResult(
@@ -1025,6 +1132,12 @@ async def capture_keylol_webpage_screenshot(
             status=final_status,
             image_paths=tuple(screenshot_paths),
             section_titles=tuple(str(section.get("title", "")) for section in sections),
+            external_image_count=external_total,
+            failed_external_image_count=failed_external_total,
+            embed_count=embed_total,
+            loaded_embed_count=loaded_embed_total,
+            fallback_embed_count=fallback_embed_total,
+            auto_expanded_collapse_count=expanded_total,
         )
     except KeylolBrowserCaptureError:
         if own_output:
@@ -1063,6 +1176,7 @@ async def capture_keylol_webpage_screenshot(
                 await playwright.stop()
             except Exception:
                 pass
+        await media_downloader.close()
 
 
 async def capture_keylol_screenshot(*args: object, **kwargs: object) -> str:

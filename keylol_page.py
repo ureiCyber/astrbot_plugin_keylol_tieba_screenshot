@@ -13,6 +13,13 @@ import aiohttp
 from bs4 import BeautifulSoup, Tag
 from PIL import Image, ImageChops
 
+try:
+    from .safe_media import SafeMediaDownloader, is_public_https_url
+    from .keylol_embeds import render_embed
+except ImportError:
+    from safe_media import SafeMediaDownloader, is_public_https_url
+    from keylol_embeds import render_embed
+
 
 DEFAULT_URL = "https://keylol.com/t1046223-1-1"
 IPHONE_SAFARI_USER_AGENT = (
@@ -88,7 +95,7 @@ _IMAGE_CANDIDATES_ATTR = "data-keylol-image-candidates"
 _REMOTE_FALLBACK_ATTR = "data-keylol-remote-fallback"
 _SAFE_ATTRS = {
     "a": {"href", "title"},
-    "figure": {"class"},
+    "figure": {"class", "data-keylol-embed-url"},
     "img": {"alt", "src", "title", _IMAGE_CANDIDATES_ATTR},
     "td": {"colspan", "rowspan"},
     "th": {"colspan", "rowspan"},
@@ -112,6 +119,38 @@ _IMAGE_PLACEHOLDER_MARKERS = (
 )
 _IMAGE_REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 _MAX_IMAGE_REDIRECTS = 5
+_CAPTURE_PROTECTED_COLLAPSE_ATTR = "data-keylol-protected-collapse"
+_RESTRICTED_CONTENT_SELECTOR = ", ".join(
+    (
+        ".showhide",
+        ".attach_nopermission",
+        ".spoiler",
+        ".bbcode_spoiler",
+        ".replyhide",
+        ".reply-hide",
+        ".reply_hidden",
+        ".reply-hidden",
+        ".hidden-reply",
+        ".hidecontent",
+        ".hide_content",
+        ".hide-content",
+        ".locked",
+        ".login-required",
+        ".login_required",
+        ".need-reply",
+        ".need_reply",
+        "[data-permission]",
+        "[data-spoiler]",
+        "[data-reply-required]",
+        "[data-reply-only]",
+        "[data-auth-required]",
+    )
+)
+_RESTRICTED_CONTENT_TEXT_RE = re.compile(
+    r"回复后|回复可见|需要回复|回复.{0,8}(?:可见|查看)|"
+    r"偷看一眼|偷看一下|权限不足|登录后|登陆后|登录可见|登陆可见|"
+    r"没有权限|权限限制"
+)
 
 
 class KeylolPageError(RuntimeError):
@@ -135,6 +174,13 @@ class Article:
     is_authenticated: bool
     unresolved_image_count: int = 0
     image_candidates: tuple[tuple[str, ...], ...] = ()
+    external_image_count: int = 0
+    failed_external_image_count: int = 0
+    embed_candidates: tuple[str, ...] = ()
+    embed_count: int = 0
+    loaded_embed_count: int = 0
+    fallback_embed_count: int = 0
+    auto_expanded_collapse_count: int = 0
 
 
 def trim_rendered_screenshot(
@@ -254,6 +300,22 @@ def _absolute_http_url(value: str, base_url: str) -> str | None:
     return absolute
 
 
+def _normalize_steam_widget_url(value: str) -> str | None:
+    """Use the shared strict Steam provider classifier when it is available."""
+
+    try:
+        from .keylol_embeds import normalize_steam_widget_url
+    except ImportError:
+        try:
+            from keylol_embeds import normalize_steam_widget_url
+        except ImportError:
+            return None
+    try:
+        return normalize_steam_widget_url(value)
+    except Exception:
+        return None
+
+
 def _is_image_placeholder(source: str) -> bool:
     normalized = source.lower()
     return any(marker in normalized for marker in _IMAGE_PLACEHOLDER_MARKERS)
@@ -268,6 +330,110 @@ def _preferred_image_source(image: Tag) -> str:
             if not _is_image_placeholder(value):
                 return value
     return candidates[0] if candidates else ""
+
+
+def _has_restricted_marker(node: Tag) -> bool:
+    classes = set(node.get("class") or [])
+    if classes.intersection(
+        {
+            "showhide",
+            "attach_nopermission",
+            "spoiler",
+            "bbcode_spoiler",
+            "replyhide",
+            "reply-hide",
+            "reply_hidden",
+            "reply-hidden",
+            "hidden-reply",
+            "hidecontent",
+            "hide_content",
+            "hide-content",
+            "locked",
+            "login-required",
+            "login_required",
+            "need-reply",
+            "need_reply",
+        }
+    ):
+        return True
+    return any(
+        attribute in node.attrs
+        for attribute in (
+            "data-permission",
+            "data-spoiler",
+            "data-reply-required",
+            "data-reply-only",
+            "data-auth-required",
+        )
+    )
+
+
+def _has_restricted_ancestor(node: Tag, root: Tag) -> bool:
+    parent = node.parent
+    while isinstance(parent, Tag):
+        if _has_restricted_marker(parent) or parent.has_attr(
+            _CAPTURE_PROTECTED_COLLAPSE_ATTR
+        ):
+            return True
+        if parent is root:
+            break
+        parent = parent.parent
+    return False
+
+
+def _direct_child_with_class(node: Tag, class_name: str) -> Tag | None:
+    for child in node.find_all(True, recursive=False):
+        if class_name in (child.get("class") or []):
+            return child
+    return None
+
+
+def _expand_ordinary_collapses(content: Tag) -> int:
+    """Expand only the known visual sff control, leaving access gates alone."""
+
+    expanded = 0
+    for box in content.select(".sff_collapse.sff_collapsed"):
+        if _has_restricted_ancestor(box, content):
+            box[_CAPTURE_PROTECTED_COLLAPSE_ATTR] = "1"
+            continue
+
+        body = _direct_child_with_class(box, "sff_collapse_b")
+        detail = _direct_child_with_class(box, "sff_collapse_d")
+        text = box.get_text(" ", strip=True)
+        protected = (
+            _has_restricted_marker(box)
+            or bool(box.select(_RESTRICTED_CONTENT_SELECTOR))
+            or bool(_RESTRICTED_CONTENT_TEXT_RE.search(text))
+            or body is None
+            or detail is None
+        )
+        if protected:
+            box[_CAPTURE_PROTECTED_COLLAPSE_ATTR] = "1"
+            continue
+
+        classes = [
+            value
+            for value in (box.get("class") or [])
+            if value != "sff_collapsed"
+        ]
+        box["class"] = classes
+        expanded += 1
+    return expanded
+
+
+def _hide_restricted_content(root: Tag, document: BeautifulSoup) -> None:
+    """Replace access-controlled subtrees before sanitizing their descendants."""
+
+    selector = (
+        _RESTRICTED_CONTENT_SELECTOR
+        + f", .sff_collapse.sff_collapsed[{_CAPTURE_PROTECTED_COLLAPSE_ATTR}]"
+    )
+    for node in list(root.select(selector)):
+        if node.parent is None or _has_restricted_ancestor(node, root):
+            continue
+        notice = document.new_tag("span")
+        notice.string = "[受限内容已保持隐藏]"
+        node.replace_with(notice)
 
 
 def _attachment_download_source(image: Tag, root: Tag) -> str:
@@ -312,7 +478,14 @@ def _image_source_candidates(image: Tag, root: Tag, base_url: str) -> list[str]:
         if not raw_source or _is_image_placeholder(raw_source):
             continue
         absolute = _absolute_http_url(raw_source, base_url)
-        secure = _normalize_secure_keylol_asset(absolute) if absolute else None
+        if absolute and _is_keylol_asset(absolute):
+            secure = _normalize_secure_keylol_asset(absolute)
+        elif absolute and is_public_https_url(absolute):
+            # Public external images are candidates for the cookie-free safe
+            # downloader. They are never left for a browser to fetch directly.
+            secure = absolute
+        else:
+            secure = None
         if not secure or secure in seen:
             continue
         seen.add(secure)
@@ -428,10 +601,10 @@ def _replace_file_media_attachments(
 
 
 def _replace_embedded_media(document: BeautifulSoup, root: Tag, base_url: str) -> None:
-    for media in list(root.find_all(["video", "audio", "iframe", "embed", "object"])):
+    for media in list(root.find_all(["video", "audio"])):
         if media.parent is None:
             continue
-        kind = "audio" if media.name == "audio" else "video"
+        kind = media.name
         label = str(media.get("title", "")).strip()
         poster = str(media.get("poster", "")).strip() if media.name == "video" else ""
         media.replace_with(
@@ -444,12 +617,59 @@ def _replace_embedded_media(document: BeautifulSoup, root: Tag, base_url: str) -
             )
         )
 
+    for media in list(root.find_all(["iframe", "embed", "object"])):
+        if media.parent is None:
+            continue
+        raw_url = str(media.get("src") or media.get("data") or "").strip()
+        absolute_url = _absolute_http_url(raw_url, base_url) if raw_url else None
+        widget_url = _normalize_steam_widget_url(absolute_url) if absolute_url else None
+        if widget_url:
+            figure = document.new_tag("figure")
+            figure["class"] = ["media-card", "media-card-embed", "media-card-steam"]
+            figure["data-keylol-embed-url"] = widget_url
+            caption = document.new_tag("figcaption")
+            heading = document.new_tag("strong")
+            heading.string = "Steam 商店内容"
+            caption.append(heading)
+            note = document.new_tag("span")
+            note.string = "（静态信息正在加载）"
+            caption.append(note)
+            figure.append(caption)
+            media.replace_with(figure)
+            continue
+
+        media.replace_with(_external_embed_card(document, absolute_url or base_url))
+
+
+def _external_embed_card(document: BeautifulSoup, source_url: str) -> Tag:
+    figure = document.new_tag("figure")
+    figure["class"] = [
+        "media-card",
+        "media-card-embed",
+        "media-card-embed-unknown",
+    ]
+    caption = document.new_tag("figcaption")
+    heading = document.new_tag("strong")
+    heading.string = "外部嵌入内容"
+    caption.append(heading)
+    note = document.new_tag("span")
+    note.string = "（静态截图无法完整加载）"
+    caption.append(note)
+    caption.append(document.new_tag("br"))
+    link = document.new_tag("a", href="#")
+    link.string = "打开原帖查看媒体"
+    caption.append(link)
+    figure.append(caption)
+    return figure
+
 
 def _clean_fragment(content: Tag, base_url: str) -> str:
     fragment = BeautifulSoup(str(content), "html.parser")
     root = fragment.find()
     if root is None:
         raise KeylolPageError("帖子主楼正文为空。")
+
+    _hide_restricted_content(root, fragment)
 
     for selector in (".rnd_ai_pr", ".a_mu", ".pstatus", ".jammer"):
         for node in root.select(selector):
@@ -483,7 +703,8 @@ def _clean_fragment(content: Tag, base_url: str) -> str:
             link.decompose()
 
     for image in list(root.find_all("img")):
-        if not _stored_image_candidates(image):
+        current_src = str(image.get("src", "")).strip()
+        if not _stored_image_candidates(image) and not is_public_https_url(current_src):
             image.decompose()
 
     for tag in list(root.find_all(True)):
@@ -519,7 +740,12 @@ def _clean_fragment(content: Tag, base_url: str) -> str:
                 tag.attrs.pop("href", None)
         elif tag.name == "img":
             src = _absolute_http_url(image_source, base_url)
-            src = _normalize_secure_keylol_asset(src) if src else None
+            if src and _is_keylol_asset(src):
+                src = _normalize_secure_keylol_asset(src)
+            elif src and is_public_https_url(src):
+                pass
+            else:
+                src = None
             if not src:
                 tag.decompose()
                 continue
@@ -611,11 +837,21 @@ def parse_article(page_html: str, source_url: str) -> Article:
     if time_node:
         published_at = str(time_node.get("title", "")).strip()
 
+    has_locked_resources = post_container.select_one(".attach_nopermission") is not None
+    auto_expanded_collapse_count = _expand_ordinary_collapses(content)
     body_html = _clean_fragment(content, source_url)
     body_html += _first_floor_attachments(post_container, content, source_url)
     body_html, image_candidates = _extract_article_image_candidates(body_html)
-    has_locked_resources = post_container.select_one(".attach_nopermission") is not None
     body_probe = BeautifulSoup(body_html, "html.parser")
+    embed_nodes = body_probe.select("figure.media-card-embed")
+    embed_candidates = tuple(
+        str(node.get("data-keylol-embed-url", "")).strip()
+        for node in embed_nodes
+        if node.get("data-keylol-embed-url")
+    )
+    unknown_embed_count = len(
+        body_probe.select(".media-card-embed-unknown")
+    )
     if (
         not body_probe.get_text(" ", strip=True)
         and body_probe.find("img") is None
@@ -635,6 +871,10 @@ def parse_article(page_html: str, source_url: str) -> Article:
         )
         is None,
         image_candidates=image_candidates,
+        embed_candidates=embed_candidates,
+        embed_count=len(embed_nodes),
+        fallback_embed_count=unknown_embed_count,
+        auto_expanded_collapse_count=auto_expanded_collapse_count,
     )
 
 
@@ -787,12 +1027,12 @@ async def _inline_keylol_images(
     network_total = 0
     unresolved = 0
 
-    images = [
-        image
-        for image in soup.find_all("img", src=True)
-        if _is_keylol_asset(str(image.get("src", "")))
-    ]
+    images = list(soup.find_all("img", src=True))
     for index, image in enumerate(images):
+        if not _is_keylol_asset(str(image.get("src", ""))):
+            # Public external images are handled by the cookie-free downloader
+            # in _inline_external_images; keep the candidate index aligned.
+            continue
         article_candidates = (
             article.image_candidates[index]
             if index < len(article.image_candidates)
@@ -882,6 +1122,94 @@ async def _inline_keylol_images(
     )
 
 
+async def _inline_external_images(
+    article: Article,
+    downloader: SafeMediaDownloader,
+    *,
+    max_image_bytes: int,
+    max_total_bytes: int,
+) -> Article:
+    """Inline public HTTPS images without forwarding page cookies.
+
+    The browser never receives an untrusted remote ``src`` from this path. A
+    failed download becomes a visible card and contributes to PARTIAL quality.
+    """
+
+    soup = BeautifulSoup(article.body_html, "html.parser")
+    external_count = 0
+    failed_count = 0
+    images = [
+        image
+        for image in soup.find_all("img", src=True)
+        if is_public_https_url(str(image.get("src", "")))
+        and not _is_keylol_asset(str(image.get("src", "")))
+    ]
+    for image in images:
+        source = str(image.get("src", ""))
+        external_count += 1
+        if external_count > 500 or max_total_bytes <= 0:
+            result = None
+        else:
+            result = await downloader.fetch_image(
+                source,
+                max_bytes=min(max_image_bytes, max_total_bytes),
+            )
+        if result is None:
+            failed_count += 1
+            card = soup.new_tag("span")
+            card["class"] = ["media-card", "media-card-image-failed"]
+            card.string = "图片加载失败（外链图片不可用）"
+            image.replace_with(card)
+            continue
+        data = base64.b64encode(result.data).decode("ascii")
+        image["src"] = f"data:{result.content_type};base64,{data}"
+        image.attrs.pop(_IMAGE_CANDIDATES_ATTR, None)
+        max_total_bytes -= len(result.data)
+
+    return replace(
+        article,
+        body_html=str(soup),
+        external_image_count=external_count,
+        failed_external_image_count=failed_count,
+        unresolved_image_count=article.unresolved_image_count + failed_count,
+    )
+
+
+async def _inline_embeds(
+    article: Article, downloader: SafeMediaDownloader
+) -> Article:
+    """Resolve provider cards into sanitized static markup for HTML fallback."""
+
+    soup = BeautifulSoup(article.body_html, "html.parser")
+    candidates = [
+        str(node.get("data-keylol-embed-url", "")).strip()
+        for node in soup.select("figure[data-keylol-embed-url]")
+    ]
+    unknown_count = len(soup.select(".media-card-embed-unknown"))
+    loaded = fallback = 0
+    for node, url in zip(list(soup.select("figure[data-keylol-embed-url]")), candidates):
+        result = await render_embed(url, downloader)
+        replacement = BeautifulSoup(result.html, "html.parser").find()
+        if replacement is None:
+            continue
+        node.replace_with(replacement)
+        loaded += int(result.loaded)
+        fallback += int(result.fallback)
+    return replace(
+        article,
+        body_html=str(soup),
+        embed_candidates=tuple(candidates),
+        embed_count=max(article.embed_count, len(candidates) + unknown_count),
+        loaded_embed_count=loaded,
+        fallback_embed_count=max(
+            article.fallback_embed_count,
+            unknown_count,
+            article.embed_count - len(candidates),
+        )
+        + fallback,
+    )
+
+
 async def fetch_article(
     raw_url: str,
     *,
@@ -929,6 +1257,20 @@ async def fetch_article(
                     max_image_bytes=max_image_bytes,
                     max_total_bytes=max_total_image_bytes,
                 )
+                downloader = SafeMediaDownloader(
+                    max_image_bytes=max_image_bytes,
+                    max_total_bytes=max_total_image_bytes,
+                )
+                try:
+                    article = await _inline_external_images(
+                        article,
+                        downloader,
+                        max_image_bytes=max_image_bytes,
+                        max_total_bytes=max_total_image_bytes,
+                    )
+                    article = await _inline_embeds(article, downloader)
+                finally:
+                    await downloader.close()
             return article
     except KeylolPageError:
         raise
@@ -957,7 +1299,8 @@ def build_render_html(
     if article.unresolved_image_count:
         image_notice = (
             '<div class="access-note">'
-            f"有 {article.unresolved_image_count} 张站内图片下载失败；请检查 Cookie、代理或图片大小限制。"
+            f"有 {article.unresolved_image_count} 张站内图片下载失败（含外链图片）；"
+            "截图中已保留失败提示。"
             "</div>"
         )
 
@@ -966,7 +1309,7 @@ def build_render_html(
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width={width}, height={height}, initial-scale=1">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src https: http: data:; style-src 'unsafe-inline'">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src https: data:; style-src 'unsafe-inline'">
   <style>
     * {{ box-sizing: border-box; }}
     html, body {{ margin: 0; padding: 0; background: #fff; color: #20242a; }}
@@ -981,6 +1324,7 @@ def build_render_html(
     .article p {{ margin: .7em 0; }}
     .article ul, .article ol {{ margin: .7em 0; padding-left: 1.6em; }}
     .article img {{ max-width: 100%; width: auto; height: auto; }}
+    .article img.tieba-emoticon {{ display: inline-block; width: 1.5em; height: 1.5em; margin: 0 .08em; vertical-align: -.3em; object-fit: contain; }}
     .article table {{ width: 100%; border-collapse: collapse; margin: 12px 0; }}
     .article td, .article th {{ padding: 7px 8px; border: 1px solid #dfe3e8; }}
     .article blockquote {{ margin: 12px 0; padding-left: 12px; color: #525b66; border-left: 3px solid #c7ccd2; }}

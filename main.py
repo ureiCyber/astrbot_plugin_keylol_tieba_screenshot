@@ -117,7 +117,7 @@ class KeylolScreenshotPlugin(Star):
         self._check_keylol_access(article, cookie)
         if article.unresolved_image_count:
             logger.warning(
-                f"其乐主楼有 {article.unresolved_image_count} 张站内图片未能内嵌；"
+                f"其乐主楼有 {article.unresolved_image_count} 张图片未能内嵌；"
                 "截图中会显示失败提示。"
             )
         viewport_width, viewport_height = self._mobile_render_size()
@@ -209,8 +209,8 @@ class KeylolScreenshotPlugin(Star):
             ) from exc
         if result.status is KeylolBrowserCaptureStatus.PARTIAL:
             logger.warning(
-                f"其乐网页截图有 {result.failed_image_count} 张图片未能显示；"
-                "截图中已插入失败提示。"
+                f"其乐网页截图不完整：{result.failed_image_count} 张图片未能显示，"
+                f"{getattr(result, 'fallback_embed_count', 0)} 处嵌入内容使用静态回退提示。"
             )
         image_paths = tuple(
             str(path)
@@ -225,7 +225,12 @@ class KeylolScreenshotPlugin(Star):
             raise KeylolBrowserCaptureError("网页截图没有生成有效图片。")
         logger.info(
             f"其乐网页截图完成：共生成 {len(image_paths)} 张，"
-            f"目录拆分={'开启' if self._split_keylol_toc_sections() else '关闭'}。"
+            f"目录拆分={'开启' if self._split_keylol_toc_sections() else '关闭'}，"
+            f"普通折叠展开 {getattr(result, 'auto_expanded_collapse_count', 0)} 处，"
+            f"外链图片 {getattr(result, 'external_image_count', 0)} 张/"
+            f"失败 {getattr(result, 'failed_external_image_count', 0)} 张，"
+            f"嵌入成功 {getattr(result, 'loaded_embed_count', 0)} 处/"
+            f"回退 {getattr(result, 'fallback_embed_count', 0)} 处。"
         )
         return list(image_paths)
 

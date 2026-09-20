@@ -49,7 +49,16 @@ ALLOWED_TIEBA_STATIC_HOSTS = {
     "himg.bdimg.com",
     "bdstatic.com",
 }
-ALLOWED_TIEBA_IMAGE_HOSTS = ALLOWED_TIEBA_HOSTS | ALLOWED_TIEBA_STATIC_HOSTS
+_LEGACY_TIEBA_EMOTICON_HOST = "static.tieba.baidu.com"
+_LEGACY_TIEBA_EMOTICON_PATH_RE = re.compile(
+    r"^/tb/editor/images/client/image_emoticon[0-9]{1,3}\.png$",
+    re.IGNORECASE,
+)
+ALLOWED_TIEBA_IMAGE_HOSTS = (
+    ALLOWED_TIEBA_HOSTS
+    | ALLOWED_TIEBA_STATIC_HOSTS
+    | {_LEGACY_TIEBA_EMOTICON_HOST}
+)
 MAX_BROWSER_PAGE_HEIGHT = 100_000
 MAX_BROWSER_IMAGE_COUNT = 500
 MAX_BROWSER_DOM_NODES = 20_000
@@ -166,6 +175,12 @@ def _is_allowed_image_request(value: str) -> bool:
     parsed = urlparse(value)
     host = (parsed.hostname or "").lower().rstrip(".")
     path = (parsed.path or "").lower()
+    if host == _LEGACY_TIEBA_EMOTICON_HOST:
+        return bool(
+            _LEGACY_TIEBA_EMOTICON_PATH_RE.fullmatch(parsed.path or "")
+            and not parsed.query
+            and not parsed.fragment
+        )
     # Tieba attachment URLs are occasionally extensionless; only permit them
     # on known image hosts and in the familiar image/attachment paths.
     if _IMAGE_EXT_RE.search(path):
@@ -277,8 +292,22 @@ async ({sourceUrl, suppliedTitle, suppliedAuthor, suppliedPublishedAt}) => {
   const badImage = /(?:none\.gif|loading(?:[._-]|\.gif)|blank|spacer)/i;
   const text = (node) => (node && node.textContent || "").replace(/\s+/g, " ").trim();
   const firstText = (root, selectors) => { for (const selector of selectors) { const value = text(root.querySelector(selector)); if (value) return value; } return ""; };
-  const allowedHost = (host) => ["tieba.baidu.com", "www.tieba.baidu.com", "tb1.bdstatic.com", "tb2.bdstatic.com", "tb3.bdstatic.com", "tb4.bdstatic.com", "tb5.bdstatic.com", "tb6.bdstatic.com", "tbpic.bdimg.com", "imgsrc.baidu.com", "imgsa.baidu.com", "img0.baidu.com", "img1.baidu.com", "img2.baidu.com", "img3.baidu.com", "tiebapic.baidu.com", "himg.bdimg.com"].includes(host.toLowerCase().replace(/\.$/, ""));
-  const absolute = (value) => { if (!value || /^javascript:/i.test(value)) return ""; try { const url = new URL(String(value).trim(), location.href); return url.protocol === "https:" && allowedHost(url.hostname) && !url.username && !url.password && !url.port ? url.href : ""; } catch (_) { return ""; } };
+  const allowedHost = (host) => ["tieba.baidu.com", "www.tieba.baidu.com", "tb1.bdstatic.com", "tb2.bdstatic.com", "tb3.bdstatic.com", "tb4.bdstatic.com", "tb5.bdstatic.com", "tb6.bdstatic.com", "tbpic.bdimg.com", "imgsrc.baidu.com", "imgsa.baidu.com", "img0.baidu.com", "img1.baidu.com", "img2.baidu.com", "img3.baidu.com", "tiebapic.baidu.com", "himg.bdimg.com", "bdstatic.com", "static.tieba.baidu.com"].includes(host.toLowerCase().replace(/\.$/, ""));
+  const legacyEmoticonUrl = /^http:\/\/static\.tieba\.baidu\.com\/tb\/editor\/images\/client\/image_emoticon[0-9]{1,3}\.png$/i;
+  const legacyEmoticonPath = /^\/tb\/editor\/images\/client\/image_emoticon[0-9]{1,3}\.png$/i;
+  const absolute = (value) => {
+    if (!value || /^javascript:/i.test(value)) return "";
+    const raw = String(value).trim();
+    // Rewrite the one known legacy HTTP image form before the general HTTPS
+    // gate. Arbitrary HTTP and other static.tieba.baidu.com paths stay blocked.
+    const candidate = legacyEmoticonUrl.test(raw) ? raw.replace(/^http:/i, "https:") : raw;
+    try {
+      const url = new URL(candidate, location.href);
+      const host = url.hostname.toLowerCase().replace(/\.$/, "");
+      if (host === "static.tieba.baidu.com" && (!legacyEmoticonPath.test(url.pathname) || url.search || url.hash)) return "";
+      return url.protocol === "https:" && allowedHost(url.hostname) && !url.username && !url.password && !url.port ? url.href : "";
+    } catch (_) { return ""; }
+  };
   const floorIsOne = (node) => {
     let postNo = ""; const field = node.getAttribute("data-field") || node.getAttribute("data-field-json") || "";
     if (field) { try { const parsed = JSON.parse(field); const nestedPostNo = parsed && parsed.content ? parsed.content.post_no : undefined; const details = parsed && typeof parsed.content === "object" ? parsed.content : parsed; postNo = String(nestedPostNo ?? details.post_no ?? details.floor ?? ""); } catch (_) {} }

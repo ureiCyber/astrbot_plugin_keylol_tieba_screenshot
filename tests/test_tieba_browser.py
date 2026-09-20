@@ -1,9 +1,7 @@
-"""Static contracts for the controlled Baidu Tieba browser renderer.
+"""Contracts for the controlled Baidu Tieba browser renderer.
 
-These tests intentionally do not launch a real browser or make network
-requests.  The renderer is expected to keep the same safety and fixed
-viewport guarantees as the Keylol renderer while using Tieba's ``/p/<tid>``
-URLs and client image hosts.
+Most tests use static checks and doubles; one behavior test evaluates the
+transform script in an installed Chromium browser without network access.
 """
 
 from __future__ import annotations
@@ -189,6 +187,31 @@ class TiebaBrowserRoutingContractTests(unittest.TestCase):
             with self.subTest(value=value):
                 self.assertFalse(accepts(value))
 
+    def test_legacy_emoticon_host_is_limited_to_the_trusted_image_path(self):
+        accepts = tieba_browser._is_allowed_image_request
+        self.assertTrue(
+            accepts(
+                "https://static.tieba.baidu.com/tb/editor/images/client/"
+                "image_emoticon25.png"
+            )
+        )
+        self.assertTrue(
+            accepts(
+                "https://tb2.bdstatic.com/tb/editor/images/client/"
+                "image_emoticon25.png"
+            )
+        )
+        for value in (
+            "http://static.tieba.baidu.com/tb/editor/images/client/image_emoticon25.png",
+            "https://static.tieba.baidu.com/other/image.png",
+            "https://static.tieba.baidu.com/tb/editor/images/client/image_emoticon25.png?x=1",
+            "http://example.com/image.png",
+            "https://localhost/image.png",
+            "https://192.168.1.10/image.png",
+        ):
+            with self.subTest(value=value):
+                self.assertFalse(accepts(value))
+
 
 class TiebaBrowserScriptContractTests(unittest.TestCase):
     def test_transform_script_selects_main_floor_hides_second_floor_and_handles_lazy_media(self):
@@ -320,6 +343,88 @@ class TiebaBrowserTileContractTests(unittest.TestCase):
                     )
                 )
         self.assertTrue(any("scrollTo(0, 0)" in script for script in page.evaluated))
+
+
+class TiebaBrowserRuntimeBehaviorTests(unittest.TestCase):
+    def test_transform_normalizes_only_the_legacy_emoticon_http_url(self):
+        playwright_factory = tieba_browser.async_playwright
+        if playwright_factory is None:
+            self.skipTest("Playwright is not installed")
+
+        async def evaluate_transform():
+            playwright = await playwright_factory().start()
+            browser = context = page = None
+            try:
+                for launch_options in (
+                    {"headless": True, "channel": "chrome"},
+                    {"headless": True, "channel": "msedge"},
+                    {"headless": True},
+                ):
+                    try:
+                        browser = await playwright.chromium.launch(**launch_options)
+                        break
+                    except Exception:
+                        continue
+                if browser is None:
+                    raise unittest.SkipTest("No installed Chromium browser is available")
+
+                context = await browser.new_context(
+                    viewport={"width": 390, "height": 844},
+                    is_mobile=True,
+                    has_touch=True,
+                )
+                page = await context.new_page()
+                await page.set_content(
+                    '''<!doctype html><html><head></head><body>
+                    <div class="l_post" data-field='{"content":{"post_no":1}}'>
+                      <div class="d_post_content">
+                        <img alt="表情" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw=="
+                          data-src="http://static.tieba.baidu.com/tb/editor/images/client/image_emoticon25.png">
+                        <img alt="公网 HTTP" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw=="
+                          data-src="http://example.com/image.png">
+                        <img alt="错误路径" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw=="
+                          data-src="http://static.tieba.baidu.com/other/image.png">
+                      </div>
+                      <div class="post-tail-wrap"><span class="tail-info">1楼</span></div>
+                    </div>
+                    </body></html>'''
+                )
+                info = await page.evaluate(
+                    tieba_browser._TRANSFORM_SCRIPT,
+                    {
+                        "sourceUrl": "https://tieba.baidu.com/p/123",
+                        "suppliedTitle": "测试帖",
+                        "suppliedAuthor": "",
+                        "suppliedPublishedAt": "",
+                    },
+                )
+                state = await page.evaluate(
+                    """() => ({
+                      candidates: [...document.querySelectorAll('img[data-tieba-candidates]')]
+                        .map((image) => JSON.parse(image.dataset.tiebaCandidates)),
+                      failures: [...document.querySelectorAll('.tieba-browser-image-failed')]
+                        .map((node) => node.textContent)
+                    })"""
+                )
+                return info, state
+            finally:
+                for resource in (page, context, browser):
+                    if resource is not None:
+                        try:
+                            await resource.close()
+                        except Exception:
+                            pass
+                await playwright.stop()
+
+        info, state = asyncio.run(evaluate_transform())
+        expected = (
+            "https://static.tieba.baidu.com/tb/editor/images/client/"
+            "image_emoticon25.png"
+        )
+        self.assertEqual(state["candidates"], [[expected]])
+        self.assertEqual(len(state["failures"]), 2)
+        self.assertEqual(info["imageCount"], 1)
+        self.assertEqual(info["missingImageCount"], 2)
 
 
 if __name__ == "__main__":

@@ -1,12 +1,17 @@
 import asyncio
+import json
 import unittest
+from pathlib import Path
 from unittest.mock import patch
+
+from bs4 import BeautifulSoup
 
 from tieba_page import (
     Article,
     _ALLOWED_IMAGE_HOSTS,
     _MAX_IMAGE_REDIRECTS,
     _inline_tieba_images,
+    _safe_tieba_image_url,
     TiebaPageError,
     _signed_form,
     account_name_from_userinfo,
@@ -145,11 +150,30 @@ API_SAMPLE = {
     ],
     "user_list": [{"id": 11, "name_show": "备用作者"}],
 }
+EMOTICON_FIXTURES = json.loads(
+    (Path(__file__).parent / "fixtures" / "tieba_emoticons.json").read_text(
+        encoding="utf-8"
+    )
+)
+
+
+def _emoticon_article(fragment: dict) -> Article:
+    return article_from_api(
+        {
+            "error_code": 0,
+            "thread": {"title": "表情测试"},
+            "post_list": [
+                {"floor": 1, "content": [{"type": 0, "text": "正文"}, fragment]}
+            ],
+        },
+        "https://tieba.baidu.com/p/10999805973",
+    )
 
 
 class TiebaPageTests(unittest.TestCase):
     def test_html_and_browser_renderers_share_the_same_image_allowlist(self):
         self.assertEqual(_ALLOWED_IMAGE_HOSTS, ALLOWED_TIEBA_IMAGE_HOSTS)
+        self.assertIn("static.tieba.baidu.com", _ALLOWED_IMAGE_HOSTS)
 
     def test_normalizes_share_url_to_canonical_thread_url(self):
         self.assertEqual(
@@ -236,6 +260,150 @@ class TiebaPageTests(unittest.TestCase):
                 "https://tieba.baidu.com/p/123",
             )
 
+    def test_api_emoticons_render_images_instead_of_internal_codes(self):
+        # The bare code is the actual type-2 fragment from thread 10999805973.
+        for kind, code, filename in (
+            (2, "image_emoticon", "image_emoticon1.png"),
+            ("2", "image_emoticon25", "image_emoticon25.png"),
+        ):
+            with self.subTest(kind=kind, code=code):
+                article = _emoticon_article({"type": kind, "text": code, "c": "呵呵"})
+                body = BeautifulSoup(article.body_html, "html.parser")
+                image = body.find("img")
+                self.assertIsNotNone(image)
+                self.assertEqual(
+                    image["src"],
+                    f"https://tb2.bdstatic.com/tb/editor/images/client/{filename}",
+                )
+                self.assertEqual(image["alt"], "呵呵")
+                self.assertIn("tieba-emoticon", image["class"])
+                self.assertEqual(body.get_text(), "正文")
+
+    def test_legacy_http_tieba_emoticon_is_upgraded_before_image_validation(self):
+        legacy = (
+            "http://static.tieba.baidu.com/tb/editor/images/client/"
+            "image_emoticon25.png"
+        )
+        article = parse_tieba_article(
+            f'<div class="l_post" data-field=\'{{"content":{{"post_no":1}}}}\'>'
+            f'<div class="j_d_post_content"><img src="{legacy}"></div>'
+            '<div class="post-tail-wrap"><span class="tail-info">1楼</span></div>'
+            "</div>",
+            "https://tieba.baidu.com/p/123",
+        )
+        body = BeautifulSoup(article.body_html, "html.parser")
+        image = body.find("img")
+        self.assertIsNotNone(image)
+        self.assertEqual(
+            image["src"],
+            "https://static.tieba.baidu.com/tb/editor/images/client/"
+            "image_emoticon25.png",
+        )
+
+    def test_legacy_normalization_does_not_allow_other_http_or_static_paths(self):
+        self.assertIsNone(
+            _safe_tieba_image_url(
+                "http://example.com/emoticon.png", "https://tieba.baidu.com/p/123"
+            )
+        )
+        self.assertIsNone(
+            _safe_tieba_image_url(
+                "http://static.tieba.baidu.com/tb/editor/images/client/other.png",
+                "https://tieba.baidu.com/p/123",
+            )
+        )
+        self.assertIsNone(
+            _safe_tieba_image_url(
+                "http://static.tieba.baidu.com:80/tb/editor/images/client/"
+                "image_emoticon25.png",
+                "https://tieba.baidu.com/p/123",
+            )
+        )
+        self.assertEqual(
+            _safe_tieba_image_url(
+                "https://tb2.bdstatic.com/tb/editor/images/client/"
+                "image_emoticon25.png",
+                "https://tieba.baidu.com/p/123",
+            ),
+            "https://tb2.bdstatic.com/tb/editor/images/client/"
+            "image_emoticon25.png",
+        )
+        for suffix in ("?tracking=1", "#fragment"):
+            with self.subTest(suffix=suffix):
+                self.assertIsNone(
+                    _safe_tieba_image_url(
+                        "https://static.tieba.baidu.com/tb/editor/images/client/"
+                        f"image_emoticon25.png{suffix}",
+                        "https://tieba.baidu.com/p/123",
+                    )
+                )
+
+    def test_emoticon_fixture_covers_standard_unknown_and_visible_fallback(self):
+        for case in EMOTICON_FIXTURES:
+            with self.subTest(name=case["name"]):
+                article = _emoticon_article(case["fragment"])
+                body = BeautifulSoup(article.body_html, "html.parser")
+                self.assertEqual(body.get_text(), case["expected_text"])
+                image = body.find("img")
+                expected_image_url = case.get("expected_image_url")
+                if expected_image_url:
+                    self.assertIsNotNone(image)
+                    self.assertEqual(image["src"], expected_image_url)
+                else:
+                    self.assertIsNone(image)
+
+    def test_unknown_emoticon_uses_escaped_description_or_placeholder(self):
+        for description, expected in (("新表情<script>", "新表情<script>"), ("", "[表情]")):
+            with self.subTest(description=description):
+                article = _emoticon_article(
+                    {"type": 2, "text": "unknown_emoticon", "c": description}
+                )
+                body = BeautifulSoup(article.body_html, "html.parser")
+                self.assertEqual(body.get_text(), "正文" + expected)
+                self.assertIsNone(body.find("img"))
+                self.assertIsNone(body.find("script"))
+
+    def test_emoticon_code_cannot_inject_url_or_markup(self):
+        for code in (
+            "image_emoticon1/../../private",
+            'image_emoticon1\" onerror=\"alert(1)',
+            "https://127.0.0.1/private.png",
+        ):
+            with self.subTest(code=code):
+                article = _emoticon_article(
+                    {"type": 2, "text": code, "c": "[表情]"}
+                )
+                self.assertNotIn("<img", article.body_html)
+                self.assertNotIn(code, article.body_html)
+
+    def test_literal_emoticon_code_in_plain_text_is_preserved(self):
+        article = _emoticon_article({"type": 0, "text": "image_emoticon"})
+        self.assertIn("正文image_emoticon", article.body_html)
+        self.assertNotIn("<img", article.body_html)
+
+    def test_emoticon_is_inlined_without_cookie_and_keeps_its_description(self):
+        article = _emoticon_article({"type": 2, "text": "image_emoticon", "c": "呵呵"})
+        for status in (200, 503):
+            with self.subTest(status=status):
+                session = _FakeSession(
+                    [_FakeResponse(status, _tiny_png(), {"Content-Type": "image/png"})]
+                )
+                with patch("tieba_page.aiohttp.ClientSession", return_value=session):
+                    result = asyncio.run(
+                        _inline_tieba_images(article, cookie="BDUSS=secret", timeout_seconds=5)
+                    )
+                self.assertEqual(len(session.requests), 1)
+                self.assertNotIn("Cookie", session.requests[0][1]["headers"])
+                body = BeautifulSoup(result.body_html, "html.parser")
+                if status == 200:
+                    image = body.find("img")
+                    self.assertTrue(image["src"].startswith("data:image/png;base64,"))
+                    self.assertEqual(image["alt"], "呵呵")
+                    self.assertIn("tieba-emoticon", image["class"])
+                else:
+                    self.assertEqual(body.get_text(), "正文呵呵")
+                    self.assertIsNone(body.find("img"))
+
     def test_rejects_client_api_without_floor_one(self):
         with self.assertRaises(TiebaPageError):
             article_from_api(
@@ -274,9 +442,11 @@ class TiebaPageTests(unittest.TestCase):
     def test_html_sanitizer_drops_external_private_and_lookalike_images(self):
         unsafe_urls = (
             "https://example.com/track.png",
+            "http://example.com/track.png",
             "http://127.0.0.1/private.png",
             "http://192.168.1.10/private.png",
             "https://localhost/private.png",
+            "http://static.tieba.baidu.com/not-an-emoticon.png",
             "https://imgsa.baidu.com.evil.example/fake.png",
             "https://user:pass@imgsa.baidu.com/private.png",
             "https://imgsa.baidu.com:8443/private.png",

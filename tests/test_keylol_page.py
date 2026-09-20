@@ -16,6 +16,7 @@ from keylol_page import (
     _download_keylol_page,
     _desktop_view_url,
     _inline_keylol_images,
+    _inline_external_images,
     build_render_html,
     extract_keylol_thread_urls,
     mobile_viewport_height,
@@ -280,6 +281,37 @@ class KeylolPageTests(unittest.TestCase):
         )
         self.assertNotIn("127.0.0.1", article.body_html)
 
+    def test_public_https_external_image_is_preserved_then_inlined_without_cookie(self):
+        page = """
+        <a id="thread_subject">公网图片</a>
+        <div id="post_1"><a id="postnum1"><em>1</em>楼</a>
+          <td id="postmessage_1"><p>正文</p>
+            <img src="https://images.example.org/public.png">
+          </td>
+        </div>
+        """
+        article = parse_article(page, "https://keylol.com/t1-1-1")
+        self.assertIn("https://images.example.org/public.png", article.body_html)
+
+        class Downloader:
+            async def fetch_image(self, url, **_kwargs):
+                self.url = url
+                return type("Image", (), {"data": _tiny_png(), "content_type": "image/png"})()
+
+        downloader = Downloader()
+        result = asyncio.run(
+            _inline_external_images(
+                article,
+                downloader,
+                max_image_bytes=1024 * 1024,
+                max_total_bytes=1024 * 1024,
+            )
+        )
+        self.assertEqual(downloader.url, "https://images.example.org/public.png")
+        self.assertIn("data:image/png;base64,", result.body_html)
+        self.assertEqual(result.external_image_count, 1)
+        self.assertEqual(result.failed_external_image_count, 0)
+
     def test_blob_attachment_keeps_primary_download_and_falls_back_when_inlining(self):
         primary_url = "https://keylol.com/forum.php?mod=attachment&aid=987"
         blob_url = "https://blob.keylol.com/attachment/987/original.png"
@@ -361,6 +393,8 @@ class KeylolPageTests(unittest.TestCase):
         self.assertIsNone(body.find("iframe"))
         self.assertNotIn("cdn.example.invalid", article.body_html)
         self.assertNotIn("onexin.com", article.body_html)
+        self.assertEqual(article.embed_count, 1)
+        self.assertEqual(article.fallback_embed_count, 1)
 
     def test_video_file_attachment_becomes_visible_static_media_card(self):
         page = """

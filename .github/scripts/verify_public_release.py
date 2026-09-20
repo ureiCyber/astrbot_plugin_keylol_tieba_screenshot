@@ -17,10 +17,12 @@ EXPECTED_FILES = {
     "__init__.py",
     "_conf_schema.json",
     "keylol_browser.py",
+    "keylol_embeds.py",
     "keylol_page.py",
     "main.py",
     "metadata.yaml",
     "requirements.txt",
+    "safe_media.py",
     "tieba_browser.py",
     "tieba_page.py",
 }

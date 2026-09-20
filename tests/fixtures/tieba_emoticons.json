@@ -1,0 +1,30 @@
+[
+  {
+    "name": "standard",
+    "fragment": {
+      "type": 2,
+      "text": "image_emoticon25",
+      "c": "呵呵"
+    },
+    "expected_image_url": "https://tb2.bdstatic.com/tb/editor/images/client/image_emoticon25.png",
+    "expected_text": "正文"
+  },
+  {
+    "name": "unknown-readable",
+    "fragment": {
+      "type": 2,
+      "text": "image_emoticon_future",
+      "c": "新表情"
+    },
+    "expected_text": "正文新表情"
+  },
+  {
+    "name": "unknown-without-readable-text",
+    "fragment": {
+      "type": 2,
+      "text": "image_emoticon_future",
+      "c": ""
+    },
+    "expected_text": "正文[表情]"
+  }
+]

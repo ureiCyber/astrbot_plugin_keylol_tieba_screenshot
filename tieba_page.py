@@ -21,6 +21,11 @@ except ImportError:  # Allows direct test execution from the plugin directory.
 
 
 ALLOWED_PAGE_HOSTS = {"tieba.baidu.com", "www.tieba.baidu.com"}
+_LEGACY_TIEBA_EMOTICON_HOST = "static.tieba.baidu.com"
+_LEGACY_TIEBA_EMOTICON_PATH_RE = re.compile(
+    r"^/tb/editor/images/client/image_emoticon[0-9]{1,3}\.png$",
+    re.IGNORECASE,
+)
 _THREAD_LINK_RE = re.compile(
     r"(?<![\w.-])(?:https?://)?(?:www\.)?tieba\.baidu\.com/p/(\d+)"
     r"(?:[/?#][^\s<>\"']*)?",
@@ -49,6 +54,7 @@ _ALLOWED_IMAGE_HOSTS = {
     "tiebapic.baidu.com",
     "himg.bdimg.com",
     "bdstatic.com",
+    _LEGACY_TIEBA_EMOTICON_HOST,
 }
 _MAX_PAGE_BYTES = 8 * 1024 * 1024
 _IMAGE_REDIRECT_STATUSES = {301, 302, 303, 307, 308}
@@ -212,6 +218,35 @@ def _absolute_http_url(value: str, base_url: str) -> str | None:
     return absolute
 
 
+def _normalize_legacy_tieba_emoticon_url(
+    value: str, base_url: str
+) -> str | None:
+    """Upgrade only the old HTTP URL shape used by Tieba emoticon PNGs."""
+
+    absolute = _absolute_http_url(value, base_url)
+    if not absolute:
+        return None
+    try:
+        parsed = urlparse(absolute)
+        port = parsed.port
+    except ValueError:
+        return None
+    if (
+        parsed.scheme.lower() != "http"
+        or parsed.netloc.lower() != _LEGACY_TIEBA_EMOTICON_HOST
+        or parsed.username
+        or parsed.password
+        or port is not None
+        or parsed.query
+        or parsed.fragment
+        or not _LEGACY_TIEBA_EMOTICON_PATH_RE.fullmatch(parsed.path or "")
+    ):
+        return None
+    return parsed._replace(
+        scheme="https", netloc=_LEGACY_TIEBA_EMOTICON_HOST
+    ).geturl()
+
+
 def _safe_tieba_image_url(value: str, base_url: str) -> str | None:
     """Resolve an image URL only when it is a first-party HTTPS asset.
 
@@ -229,6 +264,15 @@ def _safe_tieba_image_url(value: str, base_url: str) -> str | None:
         port = parsed.port
     except ValueError:
         return None
+    if parsed.scheme.lower() == "http":
+        absolute = _normalize_legacy_tieba_emoticon_url(absolute, base_url)
+        if not absolute:
+            return None
+        parsed = urlparse(absolute)
+        try:
+            port = parsed.port
+        except ValueError:
+            return None
     host = (parsed.hostname or "").lower().rstrip(".")
     if (
         parsed.scheme.lower() != "https"
@@ -238,6 +282,13 @@ def _safe_tieba_image_url(value: str, base_url: str) -> str | None:
         or port is not None
     ):
         return None
+    if host == _LEGACY_TIEBA_EMOTICON_HOST:
+        if (
+            not _LEGACY_TIEBA_EMOTICON_PATH_RE.fullmatch(parsed.path or "")
+            or parsed.query
+            or parsed.fragment
+        ):
+            return None
     return absolute
 
 
@@ -448,6 +499,30 @@ def _api_fragment_html(fragment: Any) -> str:
         kind = int(fragment.get("type") or 0)
     except (TypeError, ValueError):
         kind = 0
+
+    if kind == 2:
+        # Client emoticons carry an identifier in `text`, not a literal caption.
+        # The default smile omits its numeric suffix in API responses.
+        code = str(fragment.get("text") or "").strip()
+        label = str(fragment.get("c") or "").strip() or "[表情]"
+        match = re.fullmatch(r"image_emoticon([0-9]{1,3})?", code)
+        if not match:
+            return _api_text(label)
+        number = match.group(1) or "1"
+        candidate = (
+            "https://tb2.bdstatic.com/tb/editor/images/client/"
+            f"image_emoticon{number}.png"
+        )
+        source = _safe_tieba_image_url(
+            candidate, "https://tieba.baidu.com/"
+        )
+        if not source:
+            return _api_text(label)
+        return (
+            f'<img class="tieba-emoticon" src="{source}" '
+            f'alt="{html.escape(label, quote=True)}" '
+            'loading="eager" referrerpolicy="no-referrer">'
+        )
 
     if kind in {3, 20}:
         source = _safe_tieba_image_url(
@@ -671,7 +746,10 @@ async def _inline_tieba_images(
         for image in soup.find_all("img", src=True):
             def mark_image_failed() -> None:
                 if image.parent is not None:
-                    image.replace_with("[图片未加载]")
+                    fallback = "[图片未加载]"
+                    if "tieba-emoticon" in image.get("class", []):
+                        fallback = str(image.get("alt") or "[表情]")
+                    image.replace_with(fallback)
 
             source = str(image.get("src", ""))
             current_url = _safe_tieba_image_url(source, article.source_url)
