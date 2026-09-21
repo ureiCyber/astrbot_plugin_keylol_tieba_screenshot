@@ -268,6 +268,7 @@ class _FakeTilePage:
         self.scrolls = []
         self.evaluated = []
         self.waits = []
+        self.screenshot_scales = []
 
     async def evaluate(self, script, *args):
         self.evaluated.append(script)
@@ -280,12 +281,13 @@ class _FakeTilePage:
     async def wait_for_timeout(self, milliseconds):
         self.waits.append(milliseconds)
 
-    async def screenshot(self, **_kwargs):
-        image = Image.new("RGB", (self.width, self.viewport_height))
+    async def screenshot(self, **kwargs):
+        self.screenshot_scales.append(kwargs.get("scale"))
+        image = Image.new("RGB", (self.width * 2, self.viewport_height * 2))
         pixels = image.load()
-        for row in range(self.viewport_height):
-            value = min(255, (self.scroll_y + row + 1) * 10)
-            for x in range(self.width):
+        for row in range(self.viewport_height * 2):
+            value = min(255, (self.scroll_y + row // 2 + 1) * 10)
+            for x in range(self.width * 2):
                 pixels[x, row] = (value, value, value)
         payload = BytesIO()
         image.save(payload, format="PNG")
@@ -316,12 +318,14 @@ class TiebaBrowserTileContractTests(unittest.TestCase):
                 )
             )
             with Image.open(output) as stitched:
-                self.assertEqual(stitched.size, (4, 5))
+                self.assertEqual(stitched.size, (8, 10))
                 self.assertEqual(
-                    [stitched.getpixel((0, row))[0] for row in range(5)],
-                    [10, 20, 30, 40, 50],
+                    [stitched.getpixel((0, row))[0] for row in range(10)],
+                    [10, 10, 20, 20, 30, 30, 40, 40, 50, 50],
                 )
         self.assertEqual(page.scrolls, [0, 2])
+        self.assertEqual(page.waits, [80, 80])
+        self.assertEqual(page.screenshot_scales, ["device", "device"])
         self.assertTrue(any("scrollTo(0, 0)" in script for script in page.evaluated))
 
     def test_screenshot_failure_still_restores_page_state(self):

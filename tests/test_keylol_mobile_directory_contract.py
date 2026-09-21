@@ -139,6 +139,13 @@ class KeylolMultiImageCompatibilityTests(unittest.TestCase):
             plugin,
             "_render_screenshots",
             new=AsyncMock(return_value=["directory-1.png", "directory-2.png"]),
+        ), patch.object(
+            plugin,
+            "_prepare_image_chain",
+            new=AsyncMock(return_value=[
+                main.Comp.Image.fromFileSystem(path)
+                for path in ["directory-1.png", "directory-2.png"]
+            ]),
         ):
             result = asyncio.run(
                 collect(plugin.keylol(Event(), "https://keylol.com/t1048330-1-1"))
@@ -165,6 +172,7 @@ class _FakeTilePage:
         self.scrolls = []
         self.evaluated = []
         self.waits = []
+        self.screenshot_scales = []
 
     async def evaluate(self, script, *args):
         self.evaluated.append(script)
@@ -177,14 +185,15 @@ class _FakeTilePage:
     async def wait_for_timeout(self, milliseconds):
         self.waits.append(milliseconds)
 
-    async def screenshot(self, **_kwargs):
-        # Each row encodes its absolute document y coordinate.  The second
-        # tile overlaps the previous tile by one row and must be cropped.
-        image = Image.new("RGB", (self.width, self.viewport_height))
+    async def screenshot(self, **kwargs):
+        self.screenshot_scales.append(kwargs.get("scale"))
+        # Each pair of physical rows encodes one CSS y coordinate.  The second
+        # tile overlaps the previous CSS row and must be cropped at DPR2.
+        image = Image.new("RGB", (self.width * 2, self.viewport_height * 2))
         pixels = image.load()
-        for row in range(self.viewport_height):
-            value = min(255, (self.scroll_y + row + 1) * 10)
-            for x in range(self.width):
+        for row in range(self.viewport_height * 2):
+            value = min(255, (self.scroll_y + row // 2 + 1) * 10)
+            for x in range(self.width * 2):
                 pixels[x, row] = (value, value, value)
         payload = BytesIO()
         image.save(payload, format="PNG")
@@ -208,15 +217,16 @@ class KeylolTileStitchContractTests(unittest.TestCase):
                 )
             )
             with Image.open(output) as stitched:
-                self.assertEqual(stitched.size, (4, 5))
-                # Absolute rows 1..5; row 3 occurs once despite the tile
-                # overlap, proving the final tile was cropped at its top.
+                self.assertEqual(stitched.size, (8, 10))
+                # Each CSS row occupies two physical rows; the second tile's
+                # overlap is present once, with no missing DPR2 rows.
                 self.assertEqual(
-                    [stitched.getpixel((0, row))[0] for row in range(5)],
-                    [10, 20, 30, 40, 50],
+                    [stitched.getpixel((0, row))[0] for row in range(10)],
+                    [10, 10, 20, 20, 30, 30, 40, 40, 50, 50],
                 )
         self.assertEqual(page.scrolls, [0, 2])
         self.assertEqual(page.waits, [80, 80])
+        self.assertEqual(page.screenshot_scales, ["device", "device"])
         self.assertTrue(any("data-keylol-capture-repeated-chrome" in script for script in page.evaluated))
         self.assertTrue(any("keylol-hide-repeated-chrome" in script for script in page.evaluated))
         self.assertTrue(any("removeAttribute" in script and "scrollTo(0, 0)" in script for script in page.evaluated))

@@ -23,6 +23,8 @@ EXPECTED_FILES = {
     "metadata.yaml",
     "requirements.txt",
     "safe_media.py",
+    "screenshot_capture.py",
+    "screenshot_safety.py",
     "tieba_browser.py",
     "tieba_page.py",
 }

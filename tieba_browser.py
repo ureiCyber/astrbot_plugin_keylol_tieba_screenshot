@@ -14,10 +14,20 @@ import re
 import tempfile
 from dataclasses import dataclass
 from enum import Enum
-from io import BytesIO
 from urllib.parse import urlparse
 
-from PIL import Image
+try:
+    from .screenshot_capture import (
+        DEVICE_SCALE_FACTOR,
+        ScreenshotCaptureError,
+        _capture_segmented_screenshot,
+    )
+except ImportError:  # Direct import from the plugin directory.
+    from screenshot_capture import (  # type: ignore[no-redef]
+        DEVICE_SCALE_FACTOR,
+        ScreenshotCaptureError,
+        _capture_segmented_screenshot,
+    )
 
 try:  # Optional: the API/HTML renderer remains usable without Playwright.
     from playwright.async_api import async_playwright
@@ -62,6 +72,8 @@ ALLOWED_TIEBA_IMAGE_HOSTS = (
 MAX_BROWSER_PAGE_HEIGHT = 100_000
 MAX_BROWSER_IMAGE_COUNT = 500
 MAX_BROWSER_DOM_NODES = 20_000
+# Deprecated compatibility symbol. Final image safety is enforced by
+# screenshot_safety; page height remains bounded independently above.
 MAX_BROWSER_TOTAL_PIXELS = 120_000_000
 _POST_PATH_RE = re.compile(r"^/p/(\d+)/?$", re.I)
 _IMAGE_EXT_RE = re.compile(r"\.(?:avif|gif|jpe?g|png|webp)(?:$|[?#])", re.I)
@@ -393,37 +405,24 @@ _RESTORE_REPEATED_CHROME_SCRIPT = r"""
 async def _capture_mobile_page_tiles(page: object, output_path: str, *, width: int, viewport_height: int, page_height: int, timeout_ms: int) -> None:
     if page_height <= 0 or page_height > MAX_BROWSER_PAGE_HEIGHT:
         raise TiebaBrowserNavigationError("帖子页面过长，已停止网页截图。")
-    canvas = Image.new("RGB", (width, page_height), "white")
-    covered = 0
     try:
-        first = True
-        while covered < page_height:
-            target = min(covered, max(0, page_height - viewport_height))
-            actual = int(await page.evaluate("(value) => { window.scrollTo(0, value); return window.scrollY; }", target))  # type: ignore[attr-defined]
-            await page.wait_for_timeout(80)  # type: ignore[attr-defined]
-            png = await page.screenshot(type="png", animations="disabled", caret="hide", scale="css", timeout=timeout_ms)  # type: ignore[attr-defined]
-            with Image.open(BytesIO(png)) as opened:
-                tile = opened.convert("RGB")
-            if tile.width != width or tile.height < 1:
-                raise TiebaBrowserNavigationError("移动网页截图尺寸异常。")
-            top = max(0, covered - actual); bottom = min(tile.height, page_height - actual)
-            if bottom <= top:
-                raise TiebaBrowserNavigationError("移动网页截图无法继续拼接。")
-            canvas.paste(tile.crop((0, top, width, bottom)), (0, actual + top))
-            next_covered = actual + bottom
-            if next_covered <= covered:
-                raise TiebaBrowserNavigationError("移动网页截图无法继续拼接。")
-            covered = next_covered
-            if first:
-                await page.evaluate(_HIDE_REPEATED_CHROME_SCRIPT)  # type: ignore[attr-defined]
-                first = False
-        canvas.save(output_path, format="PNG", compress_level=6)
-    finally:
-        canvas.close()
-        try:
-            await page.evaluate(_RESTORE_REPEATED_CHROME_SCRIPT)  # type: ignore[attr-defined]
-        except Exception:
-            pass
+        await _capture_segmented_screenshot(
+            page,
+            output_path,
+            width=width,
+            viewport_height=viewport_height,
+            page_height=page_height,
+            timeout_ms=timeout_ms,
+            hide_repeated_chrome_script=_HIDE_REPEATED_CHROME_SCRIPT,
+            restore_repeated_chrome_script=_RESTORE_REPEATED_CHROME_SCRIPT,
+            max_total_height=MAX_BROWSER_PAGE_HEIGHT,
+        )
+    except ScreenshotCaptureError as exc:
+        if exc.reason == "page_height":
+            raise TiebaBrowserNavigationError("帖子页面过长，已停止网页截图。") from exc
+        if exc.reason == "dimensions":
+            raise TiebaBrowserNavigationError("移动网页截图尺寸异常。") from exc
+        raise TiebaBrowserNavigationError("移动网页截图无法继续拼接。") from exc
 
 
 async def capture_tieba_webpage_screenshot(
@@ -484,7 +483,7 @@ async def capture_tieba_webpage_screenshot(
         device = dict(getattr(playwright, "devices", {}).get("iPhone 15", {}))
         device.pop("default_browser_type", None)
         device.update({"viewport": {"width": width, "height": height}, "screen": {"width": width, "height": height}, "is_mobile": True, "has_touch": True, "locale": "zh-CN", "service_workers": "block", "accept_downloads": False})
-        device["device_scale_factor"] = max(1, int(device.get("device_scale_factor", 3)))
+        device["device_scale_factor"] = DEVICE_SCALE_FACTOR
         context = await browser.new_context(**device)
         pairs = parse_tieba_cookie_header(cookie)
         if pairs:
@@ -538,8 +537,6 @@ async def capture_tieba_webpage_screenshot(
         if int(stats.get("pageHeight", 0)) > MAX_BROWSER_PAGE_HEIGHT:
             raise TiebaBrowserNavigationError("帖子页面过长，已停止网页截图。")
         capture_height = int(stats.get("captureHeight", stats.get("pageHeight", 0)))
-        if width * capture_height > MAX_BROWSER_TOTAL_PIXELS:
-            raise TiebaBrowserNavigationError("帖子截图总长度过大，已停止处理。")
         current = screenshot_path
         if own_output or not current:
             fd, current = tempfile.mkstemp(prefix="tieba-browser-", suffix=".png"); os.close(fd); allocated.append(current)

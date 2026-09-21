@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import re
 import time
+from pathlib import Path
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -39,6 +40,7 @@ from .tieba_browser import (
     TiebaBrowserTimeoutError,
     capture_tieba_webpage_screenshot,
 )
+from .screenshot_safety import _normalize_for_qq, _validate_qq_image
 
 
 class KeylolScreenshotPlugin(Star):
@@ -48,6 +50,10 @@ class KeylolScreenshotPlugin(Star):
         concurrency = max(1, min(4, int(config.get("max_concurrency", 2))))
         self._render_slots = asyncio.Semaphore(concurrency)
         self._recent_links: dict[tuple[str, str], float] = {}
+        # Only paths allocated by our browser captures belong to this plugin.
+        # HTML renderer files remain owned by AstrBot and its temp cleaner.
+        self._owned_capture_paths: set[str] = set()
+        self._encoding_tasks: set[asyncio.Task] = set()
 
     def _cookie(self) -> str:
         return str(self.config.get("keylol_cookie", "")).strip()
@@ -69,6 +75,9 @@ class KeylolScreenshotPlugin(Star):
             "full_page": True,
             "animations": "disabled",
             "caret": "hide",
+            # AstrBot's remote HTML renderer exposes DPR levels up to 1.8,
+            # not native DPR2. Keep its real CSS-pixel fallback capability;
+            # final JPEG normalization still applies every sending safety lock.
             "scale": "css",
             "viewport_width": viewport_width,
             "viewport_height": viewport_height,
@@ -223,6 +232,7 @@ class KeylolScreenshotPlugin(Star):
                 image_paths = (image_path,)
         if not image_paths:
             raise KeylolBrowserCaptureError("网页截图没有生成有效图片。")
+        self._owned_capture_paths.update(image_paths)
         logger.info(
             f"其乐网页截图完成：共生成 {len(image_paths)} 张，"
             f"目录拆分={'开启' if self._split_keylol_toc_sections() else '关闭'}，"
@@ -240,6 +250,7 @@ class KeylolScreenshotPlugin(Star):
         """Compatibility helper returning the first Keylol browser image."""
 
         paths = await self._render_keylol_browser_screenshots(target_url, cookie)
+        self._cleanup_capture_paths(paths[1:])
         return paths[0]
 
     async def _render_keylol_html_screenshots(
@@ -292,11 +303,57 @@ class KeylolScreenshotPlugin(Star):
                 target_url, cookie, multiple=True
             )
 
-    @staticmethod
-    def _image_chain(image_paths: list[str]) -> list[object]:
-        """Build one result chain so stopped pipelines cannot drop later images."""
+    def _cleanup_capture_paths(self, image_paths: list[str]) -> None:
+        for path in image_paths:
+            if path not in self._owned_capture_paths:
+                continue
+            try:
+                Path(path).unlink(missing_ok=True)
+            except OSError:
+                # Retry on unload without logging paths or thread content.
+                continue
+            self._owned_capture_paths.discard(path)
 
-        return [Comp.Image.fromFileSystem(path) for path in image_paths]
+    def _image_chain(self, image_paths: list[str]) -> list[object]:
+        """Validate every image before exposing one complete message chain.
+
+        Bytes-backed components outlive the handler without temporary JPEGs.
+        If any directory image fails validation, none of this chain is sent.
+        """
+        if not image_paths:
+            raise ValueError("截图没有生成有效图片。")
+        try:
+            chain = []
+            for path in image_paths:
+                encoded = _normalize_for_qq(Path(path).read_bytes())
+                _validate_qq_image(encoded)
+                chain.append(Comp.Image.fromBytes(encoded))
+            return chain
+        finally:
+            self._cleanup_capture_paths(image_paths)
+
+    async def _prepare_image_chain(self, image_paths: list[str]) -> list[object]:
+        # JPEG searches can be CPU-heavy; share the existing concurrency bound
+        # without blocking AstrBot's event loop during encoding.
+        started = False
+        try:
+            async with self._render_slots:
+                worker = asyncio.create_task(asyncio.to_thread(self._image_chain, image_paths))
+                self._encoding_tasks.add(worker)
+                worker.add_done_callback(self._encoding_tasks.discard)
+                started = True
+                try:
+                    return await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    # Let the worker release its images/files before propagating.
+                    try:
+                        await worker
+                    except Exception:
+                        pass
+                    raise
+        finally:
+            if not started:
+                self._cleanup_capture_paths(image_paths)
 
     async def _render_screenshot(self, target_url: str, cookie: str) -> str:
         # Keep the historical private helper for callers/tests that expect a
@@ -376,6 +433,7 @@ class KeylolScreenshotPlugin(Star):
         image_path = str(getattr(result, "image_path", "")).strip()
         if not image_path:
             raise TiebaBrowserCaptureError("网页截图没有生成有效图片。")
+        self._owned_capture_paths.add(image_path)
         logger.info("贴吧网页截图完成。")
         return image_path
 
@@ -469,7 +527,7 @@ class KeylolScreenshotPlugin(Star):
                 cookie = self._cookie()
                 try:
                     image_paths = await self._render_screenshots(target_url, cookie)
-                    result_chain.extend(self._image_chain(image_paths))
+                    result_chain.extend(await self._prepare_image_chain(image_paths))
                     logger.info(
                         f"其乐自动回复：已把 {len(image_paths)} 张截图加入同一消息链。"
                     )
@@ -491,7 +549,7 @@ class KeylolScreenshotPlugin(Star):
                     continue
                 try:
                     image_url = await self._render_tieba_screenshot(target_url, cookie)
-                    result_chain.extend(self._image_chain([image_url]))
+                    result_chain.extend(await self._prepare_image_chain([image_url]))
                 except TiebaPageError as exc:
                     result_chain.append(Comp.Plain(f"贴吧截图失败：{exc}"))
                 except Exception as exc:
@@ -519,7 +577,7 @@ class KeylolScreenshotPlugin(Star):
             logger.info(
                 f"其乐命令回复：已把 {len(image_paths)} 张截图加入同一消息链。"
             )
-            yield event.chain_result(self._image_chain(image_paths))
+            yield event.chain_result(await self._prepare_image_chain(image_paths))
         except KeylolPageError as exc:
             yield event.plain_result(f"截图失败：{exc}")
         except Exception as exc:
@@ -574,7 +632,7 @@ class KeylolScreenshotPlugin(Star):
 
         try:
             image_url = await self._render_tieba_screenshot(target_url, cookie)
-            yield event.image_result(image_url)
+            yield event.chain_result(await self._prepare_image_chain([image_url]))
         except TiebaPageError as exc:
             yield event.plain_result(f"截图失败：{exc}")
         except Exception as exc:
@@ -607,4 +665,7 @@ class KeylolScreenshotPlugin(Star):
             yield event.plain_result("贴吧 Cookie 验证失败，请查看 AstrBot 日志。")
 
     async def terminate(self):
-        """No persistent resources are kept by this plugin."""
+        """Release browser PNGs left by interrupted or legacy single captures."""
+        if self._encoding_tasks:
+            await asyncio.gather(*tuple(self._encoding_tasks), return_exceptions=True)
+        self._cleanup_capture_paths(list(self._owned_capture_paths))

@@ -8,6 +8,7 @@ __pycache__/
 htmlcov/
 .venv/
 .test-deps/
+.test-tmp/
 *.tmp
 
 # Build and packaging artifacts

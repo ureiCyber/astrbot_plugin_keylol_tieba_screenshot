@@ -168,6 +168,8 @@ class MultiImageDeliveryTests(unittest.TestCase):
             plugin,
             "_render_screenshots",
             new=AsyncMock(return_value=paths),
+        ), patch.object(
+            plugin, "_prepare_image_chain", new=AsyncMock(return_value=[_Image(path) for path in paths]),
         ):
             yielded = asyncio.run(_collect(plugin.detect_keylol_link(event)))
 
@@ -213,6 +215,8 @@ class MultiImageDeliveryTests(unittest.TestCase):
             plugin,
             "_render_screenshots",
             new=AsyncMock(return_value=paths),
+        ), patch.object(
+            plugin, "_prepare_image_chain", new=AsyncMock(return_value=[_Image(path) for path in paths]),
         ):
             yielded = asyncio.run(
                 _collect(plugin.keylol(event, "https://keylol.com/t1048330-1-1"))

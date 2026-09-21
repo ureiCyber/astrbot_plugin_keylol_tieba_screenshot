@@ -1,6 +1,6 @@
 # 其乐 / 百度贴吧主楼截图
 
-一个为 [AstrBot](https://docs.astrbot.app/) 开发的帖子截图插件。自动识别群消息中的其乐（Keylol）和百度贴吧链接，将主楼内容生成适合手机阅读的 PNG 图片，也支持通过指令手动截图。
+一个为 [AstrBot](https://docs.astrbot.app/) 开发的帖子截图插件。自动识别群消息中的其乐（Keylol）和百度贴吧链接，将主楼内容生成适合手机阅读的图片，也支持通过指令手动截图。浏览器截取和拼接使用无损 PNG，发送前统一编码为 JPEG。
 
 ## ✨ 功能
 
@@ -11,7 +11,7 @@
 - 支持配置登录 Cookie，读取当前账号有权查看的帖子内容及附件。
 - 支持群消息去重、单条消息处理数量和截图并发限制。
 
-只截取主楼，不包含后续回复。视频、音频会显示为封面或查看原帖的提示，不能在 PNG 中播放。
+只截取主楼，不包含后续回复。视频、音频会显示为封面或查看原帖的提示，不能在截图中播放。
 
 ## 🚀 安装与更新
 
@@ -122,6 +122,14 @@ https://tieba.baidu.com/p/10937213244
 - `split_toc_sections`：其乐目录帖按章节分图，默认开启，仅对其乐网页截图生效。
 - `max_toc_sections`：目录分图上限，默认 `12` 张，范围 `1–20`；超出时只处理前面的章节。
 
+网页截图固定使用 Chromium 原生 DPR 2：`content_width` 仍控制 CSS 布局宽度，默认 390 CSS px 对应 780 物理像素；320 / 440 CSS px 分别对应 640 / 880 物理像素。不改变字号，也不在截图后放大。
+
+未触发安全限制时完整保留 DPR2 尺寸。长图先计算安全画布，再从无损 PNG 分段按统一坐标拼接；只有超限才等比缩小，不先分配完整的超大 DPR2 画布。每张目录图、贴吧图及 HTML 兼容图发送前均检查：最长边不超过 **16384 px**、总像素不超过 **20,000,000**、JPEG 不超过 **10 MiB**。这些是内部硬限制，不提供配置项。独立的 **100000 CSS px** 网页高度上限用于阻止失控页面。
+
+JPEG 优先使用 quality 100；体积超限时寻找 50–100 内可用的最高整数质量，仍无法满足才搜索更小的尺寸。所有编码尝试都来自无损像素；最终校验失败则不发送该截图。图片组件使用内存中的 JPEG 字节，浏览器产生的临时 PNG 会在组装消息后清理。
+
+HTML 兼容模式继续使用 AstrBot 的 `html_render`。其当前官方远端服务只提供 1.0 / 1.3 / 1.8 的原生 DPR 档位，不能可靠指定 DPR 2，因此兼容模式保留 CSS 像素输出，不进行后期放大或字号修改。它仍执行上述全部发送安全检查；需要原生 DPR2 时使用 `playwright` 模式。接口依据：[AstrBot HTML 渲染代理](https://github.com/AstrBotDevs/AstrBot/blob/master/astrbot/core/utils/t2i/network_strategy.py)、[官方渲染服务的 DPR 参数](https://github.com/AstrBotDevs/astrbot-t2i-service/blob/main/src/render.py)。
+
 ### 高级设置
 
 - `proxy_url`：两站网页截图及其乐内容请求使用的 HTTP / HTTPS 代理，默认为空；不作用于贴吧 API 兼容流程。请填写 AstrBot 所在环境可访问的地址。
@@ -145,6 +153,14 @@ https://tieba.baidu.com/p/10937213244
 > Cookie 相当于账号登录凭证，会以明文保存在 AstrBot 配置目录中。请使用专用小号，只在可信的 WebUI 中填写，不要发送到群聊、Issue、日志或代码仓库。
 
 ## 📋 更新日志
+
+### v0.5.3
+
+- 其乐和贴吧网页截图统一使用原生 DPR2，无损分段拼接；安全范围内保留完整物理分辨率。
+- 长图在分配画布前自适应计算安全尺寸，修复分段缩放的细节接缝问题。
+- 所有发送路径统一执行最长边、总像素和 10 MiB 文件体积安全锁，并自适应选择 JPEG 质量。
+- 使用图片字节发送并清理浏览器临时文件，补充截图、编码、发送与取消清理测试。
+- HTML 兼容模式保留真实 CSS 像素输出，不进行后期放大。
 
 ### v0.5.2
 
@@ -189,6 +205,20 @@ https://tieba.baidu.com/p/10937213244
 - 不要分享含 Cookie 的配置或日志；怀疑凭据泄露时，请及时撤销账号会话或修改密码。
 
 遇到问题可提交 [Issue](https://github.com/ureiCyber/astrbot_plugin_keylol_tieba_screenshot/issues)，说明插件版本、截图模式和错误信息，并先移除个人信息及登录凭据。
+
+## 开发验证
+
+安装 `requirements.txt` 中的依赖后，运行全部测试：
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+本地 Chromium 截图夹具会阻止所有网络请求，验证两站共享的分段逻辑、三种 CSS 宽度、短图和超限长图，并在 `.test-tmp/capture-segmented-fixture` 输出 JPEG 与 JSON 报告：
+
+```bash
+python tests/capture_segmented_fixture.py --chrome "浏览器可执行文件路径"
+```
 
 ## 📄 许可证
 

@@ -17,17 +17,24 @@ import re
 import tempfile
 from dataclasses import dataclass
 from enum import Enum
-from io import BytesIO
 from urllib.parse import parse_qsl, urlencode, urlparse
-
-from PIL import Image
 
 try:
     from .safe_media import SafeMediaDownloader, is_public_https_url
     from .keylol_embeds import render_embed
+    from .screenshot_capture import (
+        DEVICE_SCALE_FACTOR,
+        ScreenshotCaptureError,
+        _capture_segmented_screenshot,
+    )
 except ImportError:  # Direct execution from the plugin directory.
     from safe_media import SafeMediaDownloader, is_public_https_url
     from keylol_embeds import render_embed
+    from screenshot_capture import (  # type: ignore[no-redef]
+        DEVICE_SCALE_FACTOR,
+        ScreenshotCaptureError,
+        _capture_segmented_screenshot,
+    )
 
 try:  # Optional dependency.  The existing non-browser renderer must continue to work without it.
     from playwright.async_api import async_playwright
@@ -45,6 +52,8 @@ MAX_BROWSER_IMAGE_COUNT = 500
 MAX_BROWSER_DOM_NODES = 20_000
 DEFAULT_BROWSER_TOC_SECTIONS = 12
 MAX_BROWSER_TOC_SECTIONS = 20
+# Deprecated compatibility symbol. Final image safety is enforced by
+# screenshot_safety; page height remains bounded independently above.
 MAX_BROWSER_TOTAL_PIXELS = 120_000_000
 _SHORT_FIRST_PAGE_RE = re.compile(r"^/t\d+-1-\d+/?$", re.IGNORECASE)
 _MEDIA_VIDEO_RE = re.compile(r"\.(?:avi|flv|m4v|mkv|mov|mp4|ts|webm|wmv)(?:$|[?#])", re.I)
@@ -764,50 +773,28 @@ async def _capture_mobile_page_tiles(
 
     if page_height <= 0 or page_height > MAX_BROWSER_PAGE_HEIGHT:
         raise KeylolBrowserNavigationError("帖子页面过长，已停止网页截图并准备回退。")
-    canvas = Image.new("RGB", (width, page_height), "white")
-    covered = 0
-    first_tile = True
-    max_scroll = max(0, page_height - viewport_height)
     try:
-        while covered < page_height:
-            target_y = min(covered, max_scroll)
-            actual_y = int(
-                await page.evaluate(  # type: ignore[attr-defined]
-                    "(value) => { window.scrollTo(0, value); return window.scrollY; }",
-                    target_y,
-                )
-            )
-            await page.wait_for_timeout(80)  # type: ignore[attr-defined]
-            png = await page.screenshot(  # type: ignore[attr-defined]
-                type="png",
-                animations="disabled",
-                caret="hide",
-                scale="css",
-                timeout=timeout_ms,
-            )
-            with Image.open(BytesIO(png)) as opened:
-                tile = opened.convert("RGB")
-            if tile.width != width or tile.height < 1:
-                raise KeylolBrowserNavigationError("移动网页截图尺寸异常，已停止处理。")
-            crop_top = max(0, covered - actual_y)
-            crop_bottom = min(tile.height, page_height - actual_y)
-            if crop_bottom <= crop_top:
-                raise KeylolBrowserNavigationError("移动网页截图无法继续拼接。")
-            canvas.paste(tile.crop((0, crop_top, width, crop_bottom)), (0, actual_y + crop_top))
-            next_covered = actual_y + crop_bottom
-            if next_covered <= covered:
-                raise KeylolBrowserNavigationError("移动网页截图无法继续拼接。")
-            covered = next_covered
-            if first_tile:
-                await page.evaluate(_HIDE_REPEATED_CHROME_SCRIPT)  # type: ignore[attr-defined]
-                first_tile = False
-        canvas.save(output_path, format="PNG", compress_level=6)
-    finally:
-        canvas.close()
-        try:
-            await page.evaluate(_RESTORE_REPEATED_CHROME_SCRIPT)  # type: ignore[attr-defined]
-        except Exception:
-            pass
+        await _capture_segmented_screenshot(
+            page,
+            output_path,
+            width=width,
+            viewport_height=viewport_height,
+            page_height=page_height,
+            timeout_ms=timeout_ms,
+            hide_repeated_chrome_script=_HIDE_REPEATED_CHROME_SCRIPT,
+            restore_repeated_chrome_script=_RESTORE_REPEATED_CHROME_SCRIPT,
+            max_total_height=MAX_BROWSER_PAGE_HEIGHT,
+        )
+    except ScreenshotCaptureError as exc:
+        if exc.reason == "page_height":
+            raise KeylolBrowserNavigationError(
+                "帖子页面过长，已停止网页截图并准备回退。"
+            ) from exc
+        if exc.reason == "dimensions":
+            raise KeylolBrowserNavigationError(
+                "移动网页截图尺寸异常，已停止处理。"
+            ) from exc
+        raise KeylolBrowserNavigationError("移动网页截图无法继续拼接。") from exc
 
 
 async def capture_keylol_webpage_screenshot(
@@ -849,10 +836,11 @@ async def capture_keylol_webpage_screenshot(
         height = DEFAULT_BROWSER_VIEWPORT_HEIGHT
     height = min(1200, max(480, height))
 
-    own_output = output_path is None
     screenshot_path = os.fspath(output_path) if output_path is not None else ""
+    own_output = output_path is None or not screenshot_path
     screenshot_paths: list[str] = []
     allocated_paths: list[str] = []
+    completed = False
 
     playwright = browser = context = page = None
     media_downloader = SafeMediaDownloader()
@@ -889,7 +877,7 @@ async def capture_keylol_webpage_screenshot(
         device["screen"] = {"width": width, "height": height}
         device["is_mobile"] = True
         device["has_touch"] = True
-        device["device_scale_factor"] = max(1, int(device.get("device_scale_factor", 3)))
+        device["device_scale_factor"] = DEVICE_SCALE_FACTOR
         device["locale"] = "zh-CN"
         device["service_workers"] = "block"
         device["accept_downloads"] = False
@@ -1013,7 +1001,6 @@ async def capture_keylol_webpage_screenshot(
         image_total = loaded_total = failed_total = 0
         external_total = failed_external_total = 0
         embed_total = loaded_embed_total = fallback_embed_total = expanded_total = 0
-        total_pixels = 0
         capture_title = "其乐帖子"
         final_status = KeylolBrowserCaptureStatus.OK
         for section_index, section in enumerate(sections):
@@ -1087,9 +1074,6 @@ async def capture_keylol_webpage_screenshot(
             if int(stats.get("pageHeight", 0)) > MAX_BROWSER_PAGE_HEIGHT:
                 raise KeylolBrowserNavigationError("帖子页面过长，已停止网页截图并准备回退。")
             capture_height = int(stats.get("captureHeight", stats.get("pageHeight", 0)))
-            total_pixels += width * capture_height
-            if total_pixels > MAX_BROWSER_TOTAL_PIXELS:
-                raise KeylolBrowserNavigationError("目录截图总长度过大，已停止处理并准备回退。")
             current_path = screenshot_path
             if own_output or not current_path or section_index:
                 if own_output:
@@ -1122,7 +1106,7 @@ async def capture_keylol_webpage_screenshot(
             if failed or loaded < image_count or loaded_embeds < len(embeds):
                 final_status = KeylolBrowserCaptureStatus.PARTIAL
             capture_title = str(info.get("title", capture_title))
-        return KeylolBrowserCaptureResult(
+        result = KeylolBrowserCaptureResult(
             image_path=screenshot_paths[0],
             source_url=source_url,
             title=capture_title,
@@ -1139,21 +1123,11 @@ async def capture_keylol_webpage_screenshot(
             fallback_embed_count=fallback_embed_total,
             auto_expanded_collapse_count=expanded_total,
         )
+        completed = True
+        return result
     except KeylolBrowserCaptureError:
-        if own_output:
-            for path in dict.fromkeys((*allocated_paths, *screenshot_paths)):
-                try:
-                    os.remove(path)
-                except OSError:
-                    pass
         raise
     except Exception as exc:
-        if own_output:
-            for path in dict.fromkeys((*allocated_paths, *screenshot_paths)):
-                try:
-                    os.remove(path)
-                except OSError:
-                    pass
         raise KeylolBrowserCaptureError("浏览器截图失败，请检查浏览器环境后重试。") from exc
     finally:
         if page is not None:
@@ -1176,7 +1150,18 @@ async def capture_keylol_webpage_screenshot(
                 await playwright.stop()
             except Exception:
                 pass
-        await media_downloader.close()
+        try:
+            await media_downloader.close()
+        finally:
+            if not completed:
+                cleanup_paths = list(allocated_paths)
+                if own_output:
+                    cleanup_paths.extend(screenshot_paths)
+                for path in dict.fromkeys(cleanup_paths):
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
 
 
 async def capture_keylol_screenshot(*args: object, **kwargs: object) -> str:
