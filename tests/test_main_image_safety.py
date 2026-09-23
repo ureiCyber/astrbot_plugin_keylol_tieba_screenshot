@@ -232,6 +232,8 @@ class ImageChainSafetyTests(unittest.IsolatedAsyncioTestCase):
                     )
 
                     async def evaluate(script, *_):
+                        if script == getattr(module, "PAGE_SNAPSHOT_SCRIPT", None):
+                            return {"has_first_post": True, "ready_state": "complete"}
                         if script == getattr(module, "_TOC_DISCOVERY_SCRIPT", None):
                             return []
                         if script == module._TRANSFORM_SCRIPT:

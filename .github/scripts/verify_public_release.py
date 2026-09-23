@@ -26,6 +26,8 @@ EXPECTED_FILES = {
     "screenshot_capture.py",
     "screenshot_safety.py",
     "tieba_browser.py",
+    "tieba_diagnostics.py",
+    "tieba_dom.py",
     "tieba_page.py",
 }
 

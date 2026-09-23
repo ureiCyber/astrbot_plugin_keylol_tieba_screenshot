@@ -2,21 +2,30 @@
 
 This renderer is intentionally separate from :mod:`tieba_page`.  It keeps the
 real Tieba page's mobile/desktop CSS, but only permits the requested thread,
-trusted Baidu static assets, and GET image/style requests.  In particular,
+trusted Baidu static assets, and read-only requests.  In particular,
 login cookies are installed as host-only cookies on the two Tieba page hosts;
 they are never copied to an image or CDN host.
 """
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import tempfile
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from urllib.parse import urlparse
 
 from PIL import Image
+
+try:
+    from .tieba_dom import FIRST_POST_RESOLVER, FIRST_POST_READY_SCRIPT, PAGE_SNAPSHOT_SCRIPT
+    from .tieba_diagnostics import classify_tieba_failure, sanitize_diagnostics, save_failure_artifacts
+except ImportError:
+    from tieba_dom import FIRST_POST_RESOLVER, FIRST_POST_READY_SCRIPT, PAGE_SNAPSHOT_SCRIPT
+    from tieba_diagnostics import classify_tieba_failure, sanitize_diagnostics, save_failure_artifacts
 
 try:
     from .screenshot_capture import (
@@ -40,9 +49,11 @@ except ImportError:  # pragma: no cover
 DEFAULT_BROWSER_VIEWPORT_WIDTH = 390
 DEFAULT_BROWSER_VIEWPORT_HEIGHT = 844
 DEFAULT_BROWSER_TIMEOUT_MS = 45_000
+FIRST_POST_TIMEOUT_MS = 10_000
+DEBUG_DIRECTORY = Path(__file__).resolve().parent / "logs" / "debug" / "tieba"
 ALLOWED_TIEBA_HOSTS = {"tieba.baidu.com", "www.tieba.baidu.com"}
 # These are first-party/static Baidu hosts used by ordinary Tieba pages.  The
-# route handler still requires HTTPS, GET, and an image/CSS resource type.
+# route handler still requires HTTPS, GET, and an allowed resource type.
 ALLOWED_TIEBA_STATIC_HOSTS = {
     "tb1.bdstatic.com",
     "tb2.bdstatic.com",
@@ -107,6 +118,7 @@ class TiebaBrowserCaptureError(RuntimeError):
         self.cookie_present = cookie_present
         self.bduss_found = bduss_found
         self.stoken_found = stoken_found
+        self.diagnostics: dict[str, object] = {}
 
 
 class TiebaBrowserUnavailable(TiebaBrowserCaptureError):
@@ -229,6 +241,13 @@ def _is_allowed_style_request(value: str) -> bool:
     if not _safe_https_url(value, ALLOWED_TIEBA_HOSTS | ALLOWED_TIEBA_STATIC_HOSTS):
         return False
     return (urlparse(value).path or "").lower().endswith(".css")
+
+
+def _is_allowed_script_request(value: str) -> bool:
+    # A first-party bundle can generate the first floor. Do not permit arbitrary
+    # hosts, JSONP endpoints, or scripts embedded by a post on an image host.
+    hosts = ALLOWED_TIEBA_HOSTS | {f"tb{i}.bdstatic.com" for i in range(1, 7)}
+    return _safe_https_url(value, hosts) and (urlparse(value).path or "").lower().endswith(".js")
 
 
 def _is_allowed_image_request(value: str) -> bool:
@@ -441,20 +460,12 @@ async ({sourceUrl, suppliedTitle, suppliedAuthor, suppliedPublishedAt}) => {
       return url.protocol === "https:" && allowedHost(url.hostname) && !url.username && !url.password && !url.port ? url.href : "";
     } catch (_) { return ""; }
   };
-  const floorIsOne = (node) => {
-    let postNo = ""; const field = node.getAttribute("data-field") || node.getAttribute("data-field-json") || "";
-    if (field) { try { const parsed = JSON.parse(field); const nestedPostNo = parsed && parsed.content ? parsed.content.post_no : undefined; const details = parsed && typeof parsed.content === "object" ? parsed.content : parsed; postNo = String(nestedPostNo ?? details.post_no ?? details.floor ?? ""); } catch (_) {} }
-    if (/^1$/.test(postNo)) return true;
-    if (postNo && !/^1$/.test(postNo)) return false;
-    return /(?:^|\s)1楼(?:\s|$)/.test(text(node.querySelector(".tail-info, .post-tail, .p_tail, .j_l_post_num, .d_post_info, .p_props")));
-  };
-  const candidates = [...document.querySelectorAll("div.l_post, div.j_l_post")];
-  const article = candidates.find(floorIsOne);
-  const content = article && (article.querySelector(".d_post_content.j_d_post_content") || article.querySelector(".d_post_content, .j_d_post_content, .p_content"));
-  if (!article || !content || !floorIsOne(article)) throw new Error("NO_FIRST_POST");
+  const {selected, candidates} = (__RESOLVER__)();
+  if (!selected) throw new Error("NO_FIRST_POST");
+  const {article, content} = selected;
   article.setAttribute("data-tieba-capture-article", "1");
   for (const node of [document.documentElement, document.body]) { node.style.setProperty("width", "100%", "important"); node.style.setProperty("max-width", "100%", "important"); node.style.setProperty("min-width", "0", "important"); node.style.setProperty("box-sizing", "border-box", "important"); }
-  for (const node of candidates) if (node !== article) node.style.display = "none";
+  for (const node of candidates) if (node !== article && !article.contains(node) && !node.contains(article)) node.style.display = "none";
   // Desktop Tieba wraps posts in a roughly 980px fixed-width container.  A
   // 390px mobile viewport must not merely crop that container horizontally.
   for (let node = article; node && node !== document.body; node = node.parentElement) {
@@ -492,9 +503,9 @@ async ({sourceUrl, suppliedTitle, suppliedAuthor, suppliedPublishedAt}) => {
     if (!candidates.length) { if (values.some((value) => badImage.test(value))) image.remove(); else { image.replaceWith(missing(image.alt || "")); missingImageCount++; } continue; }
     image.dataset.tiebaCandidates = JSON.stringify(candidates); image.dataset.tiebaPending = "1"; image.src = placeholder; image.removeAttribute("srcset"); image.removeAttribute("data-srcset"); for (const attr of imageAttrs) if (attr !== "src") image.removeAttribute(attr); image.loading = "eager"; image.decoding = "async"; image.referrerPolicy = "strict-origin-when-cross-origin"; imageCount++;
   }
-  return {title, imageCount, missingImageCount, nodeCount: article.querySelectorAll("*").length};
+  return {title, imageCount, missingImageCount, selectedSelector: selected.selector, nodeCount: article.querySelectorAll("*").length};
 }
-"""
+""".replace("__RESOLVER__", FIRST_POST_RESOLVER)
 
 
 _SCROLL_SCRIPT = r"""
@@ -511,7 +522,7 @@ async ({maxImages, maxHeight, perImageTimeoutMs}) => {
 
 
 _FINALIZE_IMAGES_SCRIPT = r"""
-() => { const article = document.querySelector('div[data-tieba-capture-article="1"]'); const root = article || document; let failed = 0; for (const image of [...root.querySelectorAll("img")]) { if (image.complete && image.naturalWidth > 0) continue; const card = document.createElement("div"); card.className = "tieba-browser-media-card tieba-browser-image-failed"; card.textContent = `图片加载失败${image.alt ? ` · ${image.alt.slice(0,120)}` : ""}`; image.replaceWith(card); failed++; } const footer = article && article.querySelector(".tieba-capture-footer"); const footerBottom = footer ? Math.ceil(footer.getBoundingClientRect().bottom + scrollY + 8) : 0; const articleBottom = article ? Math.ceil(article.getBoundingClientRect().bottom + scrollY + 8) : document.documentElement.scrollHeight; const captureHeight = Math.max(articleBottom, footerBottom); document.body.style.minHeight = `${captureHeight}px`; return {loaded:[...root.querySelectorAll("img")].filter((image) => image.dataset.tiebaLoaded === "1" && image.complete && image.naturalWidth > 0).length, failed, pageHeight:document.documentElement.scrollHeight, captureHeight}; }
+() => { const article = document.querySelector('[data-tieba-capture-article="1"]'); const root = article || document; let failed = 0; for (const image of [...root.querySelectorAll("img")]) { if (image.complete && image.naturalWidth > 0) continue; const card = document.createElement("div"); card.className = "tieba-browser-media-card tieba-browser-image-failed"; card.textContent = `图片加载失败${image.alt ? ` · ${image.alt.slice(0,120)}` : ""}`; image.replaceWith(card); failed++; } const footer = article && article.querySelector(".tieba-capture-footer"); const footerBottom = footer ? Math.ceil(footer.getBoundingClientRect().bottom + scrollY + 8) : 0; const articleBottom = article ? Math.ceil(article.getBoundingClientRect().bottom + scrollY + 8) : document.documentElement.scrollHeight; const captureHeight = Math.max(articleBottom, footerBottom); document.body.style.minHeight = `${captureHeight}px`; return {loaded:[...root.querySelectorAll("img")].filter((image) => image.dataset.tiebaLoaded === "1" && image.complete && image.naturalWidth > 0).length, failed, pageHeight:document.documentElement.scrollHeight, captureHeight}; }
 """
 
 
@@ -521,6 +532,64 @@ _HIDE_REPEATED_CHROME_SCRIPT = r"""
 _RESTORE_REPEATED_CHROME_SCRIPT = r"""
 () => { document.getElementById("tieba-hide-repeated-chrome")?.remove(); for (const node of document.querySelectorAll("[data-tieba-capture-repeated-chrome]")) node.removeAttribute("data-tieba-capture-repeated-chrome"); scrollTo(0, 0); }
 """
+
+
+async def _page_snapshot(page: object) -> dict:
+    """Collect page evidence, never cookie/storage contents or exception strings."""
+    try:
+        return await asyncio.wait_for(page.evaluate(PAGE_SNAPSHOT_SCRIPT), timeout=2)
+    except Exception:
+        return {"url": str(getattr(page, "url", "")), "snapshot_unavailable": True}
+
+
+async def _attach_page_diagnostics(error, page, *, pairs, status, blocked_document_url, blocked_resources):
+    """Diagnostics must never replace the original native-renderer failure."""
+    if page is None:
+        return
+    try:
+        snapshot = getattr(error, "page_snapshot", None) or await _page_snapshot(page)
+        if error.stage == "navigation" or blocked_document_url:
+            classified = classify_tieba_failure(snapshot, status=status, blocked_document_url=blocked_document_url)
+            if classified and classified not in {"tieba_dom_changed", "tieba_blank_page", "tieba_page_not_loaded"}:
+                error.reason = classified
+        error.diagnostics = sanitize_diagnostics(snapshot, pairs)
+        error.diagnostics["http_status"] = status
+        error.diagnostics["blocked_resources"] = dict(blocked_resources)
+        if blocked_document_url:
+            error.diagnostics["blocked_document_url"] = sanitize_diagnostics({"url": blocked_document_url}, pairs).get("url", "")
+        error.diagnostics["debug_artifacts"] = await save_failure_artifacts(page, pairs=pairs, directory=DEBUG_DIRECTORY)
+    except Exception:
+        error.diagnostics["diagnostics_failed"] = True
+
+
+async def _wait_for_first_post(page: object, timeout_ms: int, *, status: int | None = None) -> dict:
+    snapshot = await _page_snapshot(page)
+    reason = classify_tieba_failure(snapshot, status=status)
+    # Known interstitials/errors cannot become a post just by waiting. A bare
+    # loading shell or an unfamiliar DOM, however, gets a bounded readiness wait.
+    if reason and reason not in {"tieba_dom_changed", "tieba_page_not_loaded", "tieba_blank_page", "tieba_first_post_timeout"}:
+        error = TiebaBrowserNavigationError("贴吧页面无法显示主楼。", stage="page_check", reason=reason)
+        error.page_snapshot = snapshot
+        raise error
+    if snapshot.get("has_first_post"):
+        return snapshot
+    try:
+        handle = await page.wait_for_function(FIRST_POST_READY_SCRIPT, timeout=min(FIRST_POST_TIMEOUT_MS, timeout_ms))
+        await handle.dispose()
+    except Exception as exc:
+        snapshot = await _page_snapshot(page)
+        if snapshot.get("has_first_post"):
+            return snapshot
+        timed_out = "timeout" in type(exc).__name__.lower()
+        reason = classify_tieba_failure(snapshot, status=status, wait_timed_out=timed_out)
+        error = TiebaBrowserNavigationError(
+            "贴吧首帖未能在限定时间内准备完成。",
+            stage="wait_first_post",
+            reason=reason or "tieba_dom_changed",
+        )
+        error.page_snapshot = snapshot
+        raise error from exc
+    return await _page_snapshot(page)
 
 
 async def _capture_mobile_page_tiles(page: object, output_path: str, *, width: int, viewport_height: int, page_height: int, timeout_ms: int) -> None:
@@ -603,6 +672,9 @@ async def capture_tieba_webpage_screenshot(
     screenshot_paths: list[str] = []
     completed = False
     playwright = browser = context = page = None
+    response_status = None
+    blocked_document_url = ""
+    blocked_resources: dict[str, int] = {}
     try:
         try:
             playwright = await async_playwright().start()
@@ -689,25 +761,33 @@ async def capture_tieba_webpage_screenshot(
             raise TiebaBrowserUrlError("仅支持百度贴吧的 /p/数字 帖子链接。")
 
         async def route_handler(route: object, request: object) -> None:
+            nonlocal blocked_document_url
             request_url = str(getattr(request, "url", "")); method = str(getattr(request, "method", "GET")).upper(); resource_type = str(getattr(request, "resource_type", ""))
             allowed_document = resource_type == "document" and getattr(request, "frame", None) == page.main_frame and _is_allowed_thread_document(request_url, expected_id)
             allowed_style = resource_type == "stylesheet" and _is_allowed_style_request(request_url)
             allowed_image = resource_type == "image" and _is_allowed_image_request(request_url)
-            if method == "GET" and (allowed_document or allowed_style or allowed_image):
+            allowed_script = resource_type == "script" and _is_allowed_script_request(request_url)
+            # Only a read of this very thread is allowed asynchronously; never
+            # enable all same-origin APIs (which include account mutations).
+            allowed_read = resource_type in {"xhr", "fetch"} and _is_allowed_thread_document(request_url, expected_id)
+            if method == "GET" and (allowed_document or allowed_style or allowed_image or allowed_script or allowed_read):
                 try:
                     host = (urlparse(request_url).hostname or "").lower().rstrip(".")
                 except ValueError:
                     host = ""
-                # Credentials are needed only by the main Tieba document.
-                # Strip them from every stylesheet/image request too, even if
-                # an image happens to be served from tieba.baidu.com itself.
-                if not allowed_document or host not in ALLOWED_TIEBA_HOSTS:
+                # Credentials are needed only for this thread document/read.
+                # Strip them from every static request, including JS bundles,
+                # even when the resource is served by tieba.baidu.com itself.
+                if not (allowed_document or allowed_read) or host not in ALLOWED_TIEBA_HOSTS:
                     headers = dict(await request.all_headers())  # type: ignore[attr-defined]
                     headers.pop("cookie", None); headers.pop("Cookie", None)
                     await route.continue_(headers=headers)  # type: ignore[attr-defined]
                 else:
                     await route.continue_()  # type: ignore[attr-defined]
             else:
+                blocked_resources[resource_type] = blocked_resources.get(resource_type, 0) + 1
+                if resource_type == "document" and getattr(request, "frame", None) == page.main_frame:
+                    blocked_document_url = request_url
                 await route.abort(error_code="blockedbyclient")  # type: ignore[attr-defined]
         try:
             await page.route("**/*", route_handler)
@@ -720,15 +800,16 @@ async def capture_tieba_webpage_screenshot(
                 stoken_found=stoken_found,
             ) from exc
         try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+            response = await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+            response_status = response.status if response is not None else None
         except Exception as exc:
             reason = (
-                "timeout"
+                "tieba_page_not_loaded"
                 if "timeout" in type(exc).__name__.lower()
                 else "navigation_failed"
             )
             error_type = (
-                TiebaBrowserTimeoutError if reason == "timeout" else TiebaBrowserNavigationError
+                TiebaBrowserTimeoutError if reason == "tieba_page_not_loaded" else TiebaBrowserNavigationError
             )
             raise error_type(
                 "打开贴吧页面超时或失败，请稍后重试。",
@@ -746,13 +827,14 @@ async def capture_tieba_webpage_screenshot(
                 bduss_found=bduss_found,
                 stoken_found=stoken_found,
             )
+        await _wait_for_first_post(page, timeout, status=response_status)
         try:
             info = await page.evaluate(_TRANSFORM_SCRIPT, {"sourceUrl": source_url, "suppliedTitle": str(title or "").strip()[:300], "suppliedAuthor": str(author or "").strip()[:120], "suppliedPublishedAt": str(published_at or "").strip()[:120]})
         except Exception as exc:
             raise TiebaBrowserNavigationError(
-                "页面未找到可截图的贴吧 1 楼正文；请确认链接和 Cookie 有效。",
+                "贴吧主楼 DOM 整理失败。",
                 stage="transform",
-                reason="missing_first_post",
+                reason="tieba_dom_changed" if "NO_FIRST_POST" in str(exc) else "tieba_transform_failed",
                 cookie_present=cookie_present,
                 bduss_found=bduss_found,
                 stoken_found=stoken_found,
@@ -870,6 +952,8 @@ async def capture_tieba_webpage_screenshot(
             cookie_present=cookie_present,
             pairs=pairs,
         )
+        await _attach_page_diagnostics(exc, page, pairs=pairs, status=response_status,
+            blocked_document_url=blocked_document_url, blocked_resources=blocked_resources)
         if own_output:
             for path in dict.fromkeys((*allocated, *screenshot_paths)):
                 try: os.remove(path)
@@ -880,14 +964,17 @@ async def capture_tieba_webpage_screenshot(
             for path in dict.fromkeys((*allocated, *screenshot_paths)):
                 try: os.remove(path)
                 except OSError: pass
-        raise TiebaBrowserCaptureError(
+        error = TiebaBrowserCaptureError(
             "浏览器截图失败，请检查浏览器环境后重试。",
             stage="capture",
             reason="unexpected_failure",
             cookie_present=cookie_present,
             bduss_found=bduss_found,
             stoken_found=stoken_found,
-        ) from exc
+        )
+        await _attach_page_diagnostics(error, page, pairs=pairs, status=response_status,
+            blocked_document_url=blocked_document_url, blocked_resources=blocked_resources)
+        raise error from exc
     finally:
         for resource in (page, context, browser):
             if resource is not None:

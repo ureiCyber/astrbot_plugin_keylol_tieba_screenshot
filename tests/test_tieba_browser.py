@@ -163,6 +163,8 @@ class TiebaBrowserCookieTests(unittest.TestCase):
         )
 
         async def evaluate(script, *_args):
+            if script == tieba_browser.PAGE_SNAPSHOT_SCRIPT:
+                return {"has_first_post": True, "ready_state": "complete"}
             if script == tieba_browser._TRANSFORM_SCRIPT:
                 return {"title": "fixture", "imageCount": 0, "nodeCount": 0}
             if script == tieba_browser._SCROLL_SCRIPT:
@@ -329,7 +331,7 @@ class TiebaBrowserScriptContractTests(unittest.TestCase):
         # Tieba's authoritative floor marker is nested in the data-field
         # payload (``content.post_no``); a generic first DOM node is not enough
         # because the first visible node can be an advertisement/reply.
-        self.assertIn("content.post_no", script)
+        self.assertIn("content?.post_no", script)
         self.assertRegex(script, r"(?i)(display\s*=\s*[\"']none|style\.display)")
         for marker in (
             "data-src",

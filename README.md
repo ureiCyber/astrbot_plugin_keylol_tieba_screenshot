@@ -155,6 +155,13 @@ HTML 兼容模式继续使用 AstrBot 的 `html_render`。其当前官方远端�
 
 ## 📋 更新日志
 
+### v0.5.5
+
+- 贴吧首帖定位支持多种楼层标记，并等待异步正文准备完成。
+- 单独识别登录、百度安全验证、风控及页面结构异常，避免统一误报 `missing_first_post`。
+- 原生路径失败时保存脱敏诊断信息与本地页面快照，保留 HTML 回退和全部图片安全限制。
+- 补充原生 DPR2 截图到发送边界的浏览器集成验证。
+
 ### v0.5.4
 
 - 自动识别链接、`/keylol` 与 `/tieba` 发送截图时，引用触发截图的原消息。
@@ -214,6 +221,18 @@ HTML 兼容模式继续使用 AstrBot 的 `html_render`。其当前官方远端�
 遇到问题可提交 [Issue](https://github.com/ureiCyber/astrbot_plugin_keylol_tieba_screenshot/issues)，说明插件版本、截图模式和错误信息，并先移除个人信息及登录凭据。
 
 ## 开发验证
+
+贴吧原生截图失败时，日志的 `page_diagnostics` 会记录最终 URL（查询值已遮盖）、标题、加载状态、HTML/正文长度、页面特征、各候选 selector 命中数、HTTP 状态及被拦截的资源数量。只有失败才在插件目录 `logs/debug/tieba/` 保存带时间戳的 HTML 和视口截图；HTML 会遮盖已知登录凭据，文件不会加入发送链，保存失败也不会阻止 `auto` 回退。目录已加入 Git 忽略列表，截图与 HTML 可能含帖子内容及账号显示信息。
+
+原生路径按以下顺序定位首帖，等待与 transform 共用同一套规则：
+
+1. `[data-field] / [data-field-json]` 的 `content.post_no / floor` 等楼层元数据（桌面与数据驱动布局）。
+2. `[data-floor] / [data-post-no]` 的明确楼层属性（移动或语义布局）。
+3. `.l_post / .j_l_post` 内全部楼层尾注（缺少 JSON 的旧桌面布局）。
+
+每种结构都必须确认 1 楼，再从稳定的 `post_content_` ID、桌面正文 class 或移动正文标记提取非空正文，不把首个回复或整个页面当首帖。导航后最多再等待 10 秒（不超过当前浏览器超时配置），直到首帖正文出现；不会把 `domcontentloaded` 当成正文已就绪，也不以固定 sleep 或 `networkidle` 作为首帖等待条件。允许白名单内的第一方 HTTPS `.js` 与同帖 GET 读取，仍阻止其他 API、非 GET、非目标文档和 iframe 导航。
+
+异常原因包括 `tieba_login_required`、`tieba_verify_required`、`tieba_risk_control`、`tieba_app_redirect`、`tieba_post_not_found`、`tieba_permission_denied`、`tieba_blank_page`、`tieba_page_not_loaded`、`tieba_first_post_timeout`（有加载中或未完成的主楼证据）、`tieba_dom_changed`（未识别结构）和 `tieba_transform_failed`（脚本处理异常）。普通导航栏的登录或下载提示不应单独判定为异常。验证码页面只做识别和诊断，仍由兼容模式兜底。
 
 安装 `requirements.txt` 中的依赖后，运行全部测试：
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import time
 from io import BytesIO
@@ -461,6 +462,8 @@ class KeylolScreenshotPlugin(Star):
         ]
         if isinstance(segment_index, int) and not isinstance(segment_index, bool):
             details.append(f"segment_index={segment_index}")
+        if getattr(error, "diagnostics", None):
+            details.append("page_diagnostics=" + json.dumps(error.diagnostics, ensure_ascii=False))
         return ", ".join(details)
 
     @staticmethod
