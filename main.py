@@ -3,12 +3,14 @@ from __future__ import annotations
 import asyncio
 import re
 import time
+from io import BytesIO
 from pathlib import Path
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 import astrbot.api.message_components as Comp
 from astrbot.api.star import Context, Star
+from PIL import Image
 
 from .keylol_browser import (
     KeylolBrowserCaptureError,
@@ -35,10 +37,12 @@ from .tieba_page import (
     fetch_tieba_article,
 )
 from .tieba_browser import (
+    DEVICE_SCALE_FACTOR,
     TiebaBrowserCaptureError,
     TiebaBrowserCaptureStatus,
     TiebaBrowserTimeoutError,
     capture_tieba_webpage_screenshot,
+    normalize_tieba_browser_url,
 )
 from .screenshot_safety import _normalize_for_qq, _validate_qq_image
 
@@ -325,8 +329,22 @@ class KeylolScreenshotPlugin(Star):
         try:
             chain = []
             for path in image_paths:
+                source_renderer = (
+                    "playwright" if path in self._owned_capture_paths else "html_fallback"
+                )
+                with Image.open(path) as source_image:
+                    source_width, source_height = source_image.size
                 encoded = _normalize_for_qq(Path(path).read_bytes())
                 _validate_qq_image(encoded)
+                with Image.open(BytesIO(encoded)) as final_image:
+                    final_width, final_height = final_image.size
+                logger.info(
+                    "截图发送前："
+                    f"source_renderer={source_renderer}, "
+                    f"source_width={source_width}, source_height={source_height}, "
+                    f"final_width={final_width}, final_height={final_height}, "
+                    f"safety_resize={(source_width, source_height) != (final_width, final_height)}。"
+                )
                 chain.append(Comp.Image.fromBytes(encoded))
             return chain
         finally:
@@ -354,6 +372,18 @@ class KeylolScreenshotPlugin(Star):
         finally:
             if not started:
                 self._cleanup_capture_paths(image_paths)
+
+    @staticmethod
+    def _screenshot_result(event: AstrMessageEvent, chain: list[object]):
+        """Quote the triggering message once, keeping all screenshots together."""
+        message_id = getattr(getattr(event, "message_obj", None), "message_id", None)
+        if (
+            isinstance(message_id, (str, int))
+            and str(message_id).strip()
+            and any(isinstance(component, Comp.Image) for component in chain)
+        ):
+            chain = [Comp.Reply(id=str(message_id).strip()), *chain]
+        return event.chain_result(chain)
 
     async def _render_screenshot(self, target_url: str, cookie: str) -> str:
         # Keep the historical private helper for callers/tests that expect a
@@ -405,6 +435,50 @@ class KeylolScreenshotPlugin(Star):
                 )
         return image_path
 
+    @staticmethod
+    def _diagnostic_token(value: object, default: str) -> str:
+        token = str(value or "").strip().lower()
+        return token if re.fullmatch(r"[a-z0-9_-]{1,64}", token) else default
+
+    @classmethod
+    def _tieba_browser_failure_details(
+        cls, error: TiebaBrowserCaptureError, cookie: str
+    ) -> str:
+        stage = cls._diagnostic_token(getattr(error, "stage", ""), "unknown")
+        reason = cls._diagnostic_token(
+            getattr(error, "reason", ""), "capture_failed"
+        )
+        cookie_present = getattr(error, "cookie_present", None)
+        if cookie_present is None:
+            cookie_present = bool(str(cookie or "").strip())
+        segment_index = getattr(error, "segment_index", None)
+        details = [
+            f"stage={stage}",
+            f"reason={reason}",
+            f"cookie_present={bool(cookie_present)}",
+            f"bduss_found={bool(getattr(error, 'bduss_found', False))}",
+            f"stoken_found={bool(getattr(error, 'stoken_found', False))}",
+        ]
+        if isinstance(segment_index, int) and not isinstance(segment_index, bool):
+            details.append(f"segment_index={segment_index}")
+        return ", ".join(details)
+
+    @staticmethod
+    def _normalized_tieba_log_url(result: object, target_url: str) -> str:
+        raw_url = str(getattr(result, "source_url", "") or target_url)
+        try:
+            return normalize_tieba_browser_url(raw_url)
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _png_dimensions(path: str) -> tuple[int, int]:
+        try:
+            with Image.open(path) as image:
+                return image.size
+        except Exception:
+            return 0, 0
+
     async def _render_tieba_browser_screenshot(
         self, target_url: str, cookie: str
     ) -> str:
@@ -423,7 +497,12 @@ class KeylolScreenshotPlugin(Star):
                 timeout=timeout_ms / 1000 + 10,
             )
         except asyncio.TimeoutError as exc:
-            raise TiebaBrowserTimeoutError("网页截图超过总等待时间。") from exc
+            raise TiebaBrowserTimeoutError(
+                "网页截图超过总等待时间。",
+                stage="capture",
+                reason="timeout",
+                cookie_present=bool(str(cookie or "").strip()),
+            ) from exc
 
         if result.status is TiebaBrowserCaptureStatus.PARTIAL:
             logger.warning(
@@ -432,15 +511,44 @@ class KeylolScreenshotPlugin(Star):
             )
         image_path = str(getattr(result, "image_path", "")).strip()
         if not image_path:
-            raise TiebaBrowserCaptureError("网页截图没有生成有效图片。")
+            raise TiebaBrowserCaptureError(
+                "网页截图没有生成有效图片。",
+                stage="capture",
+                reason="missing_image",
+                cookie_present=bool(str(cookie or "").strip()),
+            )
         self._owned_capture_paths.add(image_path)
-        logger.info("贴吧网页截图完成。")
+        raw_width = int(getattr(result, "raw_png_width", 0) or 0)
+        raw_height = int(getattr(result, "raw_png_height", 0) or 0)
+        if raw_width <= 0 or raw_height <= 0:
+            raw_width, raw_height = self._png_dimensions(image_path)
+        viewport_css_width = int(
+            getattr(result, "viewport_css_width", 0) or viewport_width
+        )
+        device_pixel_ratio = int(
+            getattr(result, "device_pixel_ratio", 0) or DEVICE_SCALE_FACTOR
+        )
+        result_cookie_present = getattr(result, "cookie_present", None)
+        if result_cookie_present is None:
+            result_cookie_present = bool(str(cookie or "").strip())
+        logger.info(
+            "贴吧 Playwright 截图完成："
+            "engine=playwright, "
+            f"final_url={self._normalized_tieba_log_url(result, target_url)}, "
+            f"cookie_present={bool(result_cookie_present)}, "
+            f"bduss_found={bool(getattr(result, 'bduss_found', False))}, "
+            f"stoken_found={bool(getattr(result, 'stoken_found', False))}, "
+            f"viewport_css_width={viewport_css_width}, "
+            f"device_pixel_ratio={device_pixel_ratio}, "
+            f"raw_png_width={raw_width}, raw_png_height={raw_height}。"
+        )
         return image_path
 
     async def _render_tieba_screenshot(self, target_url: str, cookie: str) -> str:
         engine = self._tieba_render_engine()
         logger.info(
-            f"贴吧截图开始：engine={engine}, has_cookie={bool(cookie)}。"
+            "贴吧截图开始："
+            f"engine={engine}, cookie_present={bool(str(cookie or '').strip())}。"
         )
         async with self._render_slots:
             if engine != "html":
@@ -449,10 +557,24 @@ class KeylolScreenshotPlugin(Star):
                         target_url, cookie
                     )
                 except TiebaBrowserCaptureError as exc:
+                    details = self._tieba_browser_failure_details(exc, cookie)
                     if engine == "playwright":
+                        logger.warning(
+                            "贴吧 Playwright 截图失败："
+                            f"{details}, fallback_reason={self._diagnostic_token(getattr(exc, 'reason', ''), 'capture_failed')}；"
+                            "engine=playwright，不回退。"
+                        )
                         raise TiebaPageError(str(exc)) from exc
-                    logger.warning(f"贴吧网页截图不可用，已回退兼容模式：{exc}")
-            return await self._render_tieba_html_screenshot(target_url, cookie)
+                    logger.warning(
+                        "贴吧 Playwright 截图失败："
+                        f"{details}, fallback_reason={self._diagnostic_token(getattr(exc, 'reason', ''), 'capture_failed')}；"
+                        "engine=auto，将回退兼容模式。"
+                    )
+            rendered = await self._render_tieba_html_screenshot(target_url, cookie)
+            logger.info(
+                "贴吧兼容截图完成：source_renderer=html_fallback, native_dpr2=False。"
+            )
+            return rendered
 
     @staticmethod
     def _message_payloads(event: AstrMessageEvent) -> list[object]:
@@ -560,7 +682,7 @@ class KeylolScreenshotPlugin(Star):
                         )
                     )
         if result_chain:
-            yield event.chain_result(result_chain)
+            yield self._screenshot_result(event, result_chain)
 
     @filter.command("keylol")
     async def keylol(self, event: AstrMessageEvent, url: str = ""):
@@ -577,7 +699,7 @@ class KeylolScreenshotPlugin(Star):
             logger.info(
                 f"其乐命令回复：已把 {len(image_paths)} 张截图加入同一消息链。"
             )
-            yield event.chain_result(await self._prepare_image_chain(image_paths))
+            yield self._screenshot_result(event, await self._prepare_image_chain(image_paths))
         except KeylolPageError as exc:
             yield event.plain_result(f"截图失败：{exc}")
         except Exception as exc:
@@ -632,7 +754,7 @@ class KeylolScreenshotPlugin(Star):
 
         try:
             image_url = await self._render_tieba_screenshot(target_url, cookie)
-            yield event.chain_result(await self._prepare_image_chain([image_url]))
+            yield self._screenshot_result(event, await self._prepare_image_chain([image_url]))
         except TiebaPageError as exc:
             yield event.plain_result(f"截图失败：{exc}")
         except Exception as exc:

@@ -62,25 +62,81 @@ class TiebaMainRenderModeTests(unittest.TestCase):
     def test_auto_mode_browser_failure_falls_back_to_html_renderer(self):
         plugin = self._plugin(tieba_render_engine="auto")
         browser = AsyncMock(
-            side_effect=main.TiebaBrowserCaptureError("unavailable")
+            side_effect=main.TiebaBrowserCaptureError(
+                "贴吧 Cookie 中未找到 BDUSS。",
+                stage="cookie_parse",
+                reason="missing_bduss",
+                cookie_present=True,
+                bduss_found=False,
+                stoken_found=True,
+            )
         )
         html = AsyncMock(return_value="html.png")
-        with patch.object(plugin, "_render_tieba_browser_screenshot", browser), patch.object(
-            plugin, "_render_tieba_html_screenshot", html
-        ):
+        with patch.object(
+            plugin, "_render_tieba_browser_screenshot", browser
+        ), patch.object(plugin, "_render_tieba_html_screenshot", html), patch.object(
+            main.logger, "warning"
+        ) as warning, patch.object(main.logger, "info") as info:
             result = asyncio.run(
                 plugin._render_tieba_screenshot(
-                    "https://tieba.baidu.com/p/10937213244", "BDUSS=secret"
+                    "https://tieba.baidu.com/p/10937213244", "STOKEN=secret-stoken"
                 )
             )
 
         self.assertEqual(result, "html.png")
         browser.assert_awaited_once_with(
-            "https://tieba.baidu.com/p/10937213244", "BDUSS=secret"
+            "https://tieba.baidu.com/p/10937213244", "STOKEN=secret-stoken"
         )
         html.assert_awaited_once_with(
-            "https://tieba.baidu.com/p/10937213244", "BDUSS=secret"
+            "https://tieba.baidu.com/p/10937213244", "STOKEN=secret-stoken"
         )
+        warning_text = "\n".join(str(call.args[0]) for call in warning.call_args_list)
+        self.assertIn("stage=cookie_parse", warning_text)
+        self.assertIn("reason=missing_bduss", warning_text)
+        self.assertIn("bduss_found=False", warning_text)
+        self.assertIn("stoken_found=True", warning_text)
+        self.assertIn("engine=auto，将回退兼容模式", warning_text)
+        self.assertNotIn("secret-stoken", warning_text)
+        self.assertTrue(
+            any(
+                "source_renderer=html_fallback" in str(call.args[0])
+                for call in info.call_args_list
+            )
+        )
+
+    def test_playwright_success_log_contains_css_dpr_and_raw_physical_dimensions(self):
+        plugin = self._plugin(tieba_render_engine="playwright", content_width=440)
+        result = SimpleNamespace(
+            status=main.TiebaBrowserCaptureStatus.OK,
+            failed_image_count=0,
+            image_path="browser.png",
+            source_url="https://tieba.baidu.com/p/10937213244",
+            cookie_present=True,
+            bduss_found=True,
+            stoken_found=True,
+            viewport_css_width=440,
+            device_pixel_ratio=2,
+            raw_png_width=880,
+            raw_png_height=1234,
+        )
+        with patch.object(
+            main, "capture_tieba_webpage_screenshot", AsyncMock(return_value=result)
+        ), patch.object(main.logger, "info") as info:
+            output = asyncio.run(
+                plugin._render_tieba_browser_screenshot(
+                    "https://tieba.baidu.com/p/10937213244", "BDUSS=secret"
+                )
+            )
+
+        self.assertEqual(output, "browser.png")
+        text = "\n".join(str(call.args[0]) for call in info.call_args_list)
+        self.assertIn("engine=playwright", text)
+        self.assertIn("final_url=https://tieba.baidu.com/p/10937213244", text)
+        self.assertIn("viewport_css_width=440", text)
+        self.assertIn("device_pixel_ratio=2", text)
+        self.assertIn("raw_png_width=880", text)
+        self.assertIn("raw_png_height=1234", text)
+        self.assertNotIn("secret", text)
 
     def test_forced_playwright_converts_browser_failure_to_tieba_page_error(self):
         plugin = self._plugin(tieba_render_engine="playwright")

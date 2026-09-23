@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from enum import Enum
 from urllib.parse import urlparse
 
+from PIL import Image
+
 try:
     from .screenshot_capture import (
         DEVICE_SCALE_FACTOR,
@@ -84,21 +86,62 @@ _MEDIA_AUDIO_RE = re.compile(r"\.(?:aac|amr|flac|m4a|mp3|ogg|opus|wav|wma)(?:$|[
 class TiebaBrowserCaptureError(RuntimeError):
     """Base class for errors safe to show to a command caller."""
 
+    default_stage = "unknown"
+    default_reason = "capture_failed"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        stage: str | None = None,
+        reason: str | None = None,
+        segment_index: int | None = None,
+        cookie_present: bool | None = None,
+        bduss_found: bool | None = None,
+        stoken_found: bool | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.stage = stage or self.default_stage
+        self.reason = reason or self.default_reason
+        self.segment_index = segment_index
+        self.cookie_present = cookie_present
+        self.bduss_found = bduss_found
+        self.stoken_found = stoken_found
+
 
 class TiebaBrowserUnavailable(TiebaBrowserCaptureError):
     """Playwright or a usable Chromium browser is unavailable."""
+
+    default_stage = "browser_launch"
+    default_reason = "unavailable"
 
 
 class TiebaBrowserUrlError(TiebaBrowserCaptureError):
     """The URL is not a supported Tieba thread URL."""
 
+    default_stage = "navigation"
+    default_reason = "invalid_url"
+
 
 class TiebaBrowserNavigationError(TiebaBrowserCaptureError):
     """The isolated page was not the requested thread or had no first post."""
 
+    default_stage = "navigation"
+    default_reason = "navigation_failed"
+
 
 class TiebaBrowserTimeoutError(TiebaBrowserCaptureError):
     """Bounded browser navigation or screenshot work timed out."""
+
+    default_stage = "capture"
+    default_reason = "timeout"
+
+
+class TiebaBrowserCookieError(TiebaBrowserCaptureError):
+    """The supplied Cookie header cannot provide the browser credentials."""
+
+    default_stage = "cookie_parse"
+    default_reason = "invalid_cookie"
 
 
 class TiebaBrowserCaptureStatus(str, Enum):
@@ -116,6 +159,13 @@ class TiebaBrowserCaptureResult:
     failed_image_count: int
     status: TiebaBrowserCaptureStatus
     image_paths: tuple[str, ...] = ()
+    cookie_present: bool = False
+    bduss_found: bool = False
+    stoken_found: bool = False
+    viewport_css_width: int = 0
+    device_pixel_ratio: int = DEVICE_SCALE_FACTOR
+    raw_png_width: int = 0
+    raw_png_height: int = 0
 
 
 def normalize_tieba_browser_url(raw_url: str) -> str:
@@ -202,52 +252,111 @@ def _is_allowed_image_request(value: str) -> bool:
     )
 
 
-_COOKIE_NAME_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
-_COOKIE_ATTRIBUTES = {
-    "domain", "expires", "httponly", "max-age", "path", "samesite", "secure"
-}
-
-
 def parse_tieba_cookie_header(cookie: str) -> list[tuple[str, str]]:
     """Extract only BDUSS and STOKEN from a Cookie header.
 
-    Unknown fields are intentionally ignored.  This makes it impossible for a
-    caller's unrelated Baidu cookies to be installed in the browser context.
+    Only the two credentials used by the browser context are interpreted.
+    Everything else is deliberately ignored, including copied browser
+    attributes and malformed unrelated segments.  Header-level injection
+    characters and NUL are rejected before any segment is considered.
     """
 
     raw = str(cookie or "").strip()
-    if not raw:
-        return []
+    cookie_present = bool(raw)
     if "\r" in raw or "\n" in raw:
-        raise TiebaBrowserCaptureError("Cookie 配置格式无效。")
+        raise TiebaBrowserCookieError(
+            "Cookie 配置格式无效。",
+            reason="header_injection",
+            cookie_present=cookie_present,
+        )
+    if "\x00" in raw:
+        nul_segment_index: int | None = None
+        for segment_index, piece in enumerate(raw.split(";")):
+            item = piece.strip()
+            if "=" not in item:
+                continue
+            name, _value = (part.strip() for part in item.split("=", 1))
+            if "\x00" in item and name.upper() in {"BDUSS", "STOKEN"}:
+                nul_segment_index = segment_index
+                break
+        raise TiebaBrowserCookieError(
+            "Cookie 配置格式无效。",
+            reason="nul_value",
+            segment_index=nul_segment_index,
+            cookie_present=cookie_present,
+        )
+    if not raw:
+        raise TiebaBrowserCookieError(
+            "贴吧 Cookie 中未找到 BDUSS。",
+            reason="missing_bduss",
+            cookie_present=False,
+            bduss_found=False,
+            stoken_found=False,
+        )
     if raw.lower().startswith("cookie:"):
         raw = raw[7:].strip()
     found: dict[str, str] = {}
-    for piece in raw.split(";"):
+    for _segment_index, piece in enumerate(raw.split(";")):
         item = piece.strip()
         if not item:
             continue
         if "=" not in item:
-            # Cookie attributes/flags are not credentials and are ignored.
-            if item.lower() in _COOKIE_ATTRIBUTES or item.startswith("$"):
-                continue
-            raise TiebaBrowserCaptureError("Cookie 配置格式无效。")
-        name, value = (part.strip() for part in item.split("=", 1))
-        if name.lower() in _COOKIE_ATTRIBUTES or name.startswith("$"):
+            # A copied browser Cookie header can contain flags or unrelated
+            # bare text.  Neither can provide a browser credential.
             continue
+        name, value = (part.strip() for part in item.split("=", 1))
         upper = name.upper()
         if upper not in {"BDUSS", "STOKEN"}:
-            if not _COOKIE_NAME_RE.fullmatch(name) or "\x00" in value:
-                raise TiebaBrowserCaptureError("Cookie 配置格式无效。")
+            # Never validate or install unrelated browser cookies.  In
+            # particular, odd names and values from a copied Cookie header
+            # must not make the Playwright path fail.
             continue
-        if not _COOKIE_NAME_RE.fullmatch(name) or "\x00" in value:
-            raise TiebaBrowserCaptureError("Cookie 配置格式无效。")
+        if "\x00" in name or "\x00" in value:
+            raise TiebaBrowserCookieError(
+                "Cookie 配置格式无效。",
+                reason="nul_value",
+                segment_index=_segment_index,
+                cookie_present=cookie_present,
+                bduss_found=bool(found.get("BDUSS")),
+                stoken_found=bool(found.get("STOKEN")),
+            )
         found[upper] = value
-    return [(name, found[name]) for name in ("BDUSS", "STOKEN") if name in found]
+
+    bduss = found.get("BDUSS", "")
+    stoken = found.get("STOKEN", "")
+    if not bduss:
+        raise TiebaBrowserCookieError(
+            "贴吧 Cookie 中未找到 BDUSS。",
+            reason="missing_bduss",
+            cookie_present=cookie_present,
+            bduss_found=False,
+            stoken_found=bool(stoken),
+        )
+    return [
+        (name, value)
+        for name, value in (("BDUSS", bduss), ("STOKEN", stoken))
+        if value
+    ]
 
 
 # Alias matching the naming used by the Keylol browser module.
 parse_tieba_browser_cookie_header = parse_tieba_cookie_header
+
+
+def _attach_cookie_diagnostics(
+    error: TiebaBrowserCaptureError,
+    *,
+    cookie_present: bool,
+    pairs: list[tuple[str, str]] | None,
+) -> TiebaBrowserCaptureError:
+    """Add non-secret Cookie presence flags to an already safe error."""
+
+    error.cookie_present = cookie_present
+    if pairs is not None:
+        names = {name.upper() for name, _value in pairs}
+        error.bduss_found = "BDUSS" in names
+        error.stoken_found = "STOKEN" in names
+    return error
 
 
 def _bounded_timeout(value: object) -> int:
@@ -271,12 +380,20 @@ def _playwright_proxy(value: str) -> dict[str, str] | None:
     if not raw:
         return None
     if "\r" in raw or "\n" in raw:
-        raise TiebaBrowserCaptureError("代理配置格式无效。")
+        raise TiebaBrowserCaptureError(
+            "代理配置格式无效。",
+            stage="browser_launch",
+            reason="invalid_proxy",
+        )
     try:
         parsed = urlparse(raw)
         port = parsed.port
     except ValueError as exc:
-        raise TiebaBrowserCaptureError("代理配置格式无效。") from exc
+        raise TiebaBrowserCaptureError(
+            "代理配置格式无效。",
+            stage="browser_launch",
+            reason="invalid_proxy",
+        ) from exc
     if (
         parsed.scheme.lower() not in {"http", "https", "socks5"}
         or not parsed.hostname
@@ -284,7 +401,11 @@ def _playwright_proxy(value: str) -> dict[str, str] | None:
         or parsed.query
         or parsed.fragment
     ):
-        raise TiebaBrowserCaptureError("代理配置格式无效。")
+        raise TiebaBrowserCaptureError(
+            "代理配置格式无效。",
+            stage="browser_launch",
+            reason="invalid_proxy",
+        )
     server = f"{parsed.scheme.lower()}://{parsed.hostname}"
     if port:
         server += f":{port}"
@@ -404,7 +525,11 @@ _RESTORE_REPEATED_CHROME_SCRIPT = r"""
 
 async def _capture_mobile_page_tiles(page: object, output_path: str, *, width: int, viewport_height: int, page_height: int, timeout_ms: int) -> None:
     if page_height <= 0 or page_height > MAX_BROWSER_PAGE_HEIGHT:
-        raise TiebaBrowserNavigationError("帖子页面过长，已停止网页截图。")
+        raise TiebaBrowserNavigationError(
+            "帖子页面过长，已停止网页截图。",
+            stage="capture",
+            reason="page_height",
+        )
     try:
         await _capture_segmented_screenshot(
             page,
@@ -419,10 +544,22 @@ async def _capture_mobile_page_tiles(page: object, output_path: str, *, width: i
         )
     except ScreenshotCaptureError as exc:
         if exc.reason == "page_height":
-            raise TiebaBrowserNavigationError("帖子页面过长，已停止网页截图。") from exc
+            raise TiebaBrowserNavigationError(
+                "帖子页面过长，已停止网页截图。",
+                stage="capture",
+                reason="page_height",
+            ) from exc
         if exc.reason == "dimensions":
-            raise TiebaBrowserNavigationError("移动网页截图尺寸异常。") from exc
-        raise TiebaBrowserNavigationError("移动网页截图无法继续拼接。") from exc
+            raise TiebaBrowserNavigationError(
+                "移动网页截图尺寸异常。",
+                stage="capture",
+                reason="dimensions",
+            ) from exc
+        raise TiebaBrowserNavigationError(
+            "移动网页截图无法继续拼接。",
+            stage="capture",
+            reason=exc.reason or "capture_failed",
+        ) from exc
 
 
 async def capture_tieba_webpage_screenshot(
@@ -442,8 +579,18 @@ async def capture_tieba_webpage_screenshot(
 ) -> TiebaBrowserCaptureResult:
     url = normalize_tieba_browser_url(raw_url)
     source_url = url
+    cookie_present = bool(str(cookie or "").strip())
+    pairs = parse_tieba_cookie_header(cookie)
+    cookie_names = {name.upper() for name, _value in pairs}
+    bduss_found = "BDUSS" in cookie_names
+    stoken_found = "STOKEN" in cookie_names
     if async_playwright is None:
-        raise TiebaBrowserUnavailable("浏览器截图功能不可用，请安装 Playwright 后重试。")
+        raise TiebaBrowserUnavailable(
+            "浏览器截图功能不可用，请安装 Playwright 后重试。",
+            cookie_present=cookie_present,
+            bduss_found=bduss_found,
+            stoken_found=stoken_found,
+        )
     timeout = _bounded_timeout(timeout_ms)
     width = _bounded_width(viewport_width)
     try:
@@ -457,7 +604,16 @@ async def capture_tieba_webpage_screenshot(
     completed = False
     playwright = browser = context = page = None
     try:
-        playwright = await async_playwright().start()
+        try:
+            playwright = await async_playwright().start()
+        except Exception as exc:
+            raise TiebaBrowserUnavailable(
+                "浏览器运行时启动失败，请检查 Playwright 安装。",
+                reason="playwright_start_failed",
+                cookie_present=cookie_present,
+                bduss_found=bduss_found,
+                stoken_found=stoken_found,
+            ) from exc
         launch_kwargs: dict[str, object] = {"headless": True}
         if executable_path:
             launch_kwargs["executable_path"] = os.fspath(executable_path)
@@ -470,7 +626,13 @@ async def capture_tieba_webpage_screenshot(
             browser = await playwright.chromium.launch(**launch_kwargs)
         except Exception as first_error:
             if executable_path or browser_channel.strip().lower() in {"chrome", "msedge"}:
-                raise TiebaBrowserUnavailable("浏览器不可用，请检查浏览器安装或路径。") from first_error
+                raise TiebaBrowserUnavailable(
+                    "浏览器不可用，请检查浏览器安装或路径。",
+                    reason="launch_failed",
+                    cookie_present=cookie_present,
+                    bduss_found=bduss_found,
+                    stoken_found=stoken_found,
+                ) from first_error
             for channel in ("chrome", "msedge"):
                 try:
                     fallback = dict(launch_kwargs); fallback["channel"] = channel; fallback.pop("executable_path", None)
@@ -479,16 +641,49 @@ async def capture_tieba_webpage_screenshot(
                 except Exception:
                     browser = None
             if browser is None:
-                raise TiebaBrowserUnavailable("未找到可用的 Chromium 浏览器。") from first_error
+                raise TiebaBrowserUnavailable(
+                    "未找到可用的 Chromium 浏览器。",
+                    reason="launch_failed",
+                    cookie_present=cookie_present,
+                    bduss_found=bduss_found,
+                    stoken_found=stoken_found,
+                ) from first_error
         device = dict(getattr(playwright, "devices", {}).get("iPhone 15", {}))
         device.pop("default_browser_type", None)
         device.update({"viewport": {"width": width, "height": height}, "screen": {"width": width, "height": height}, "is_mobile": True, "has_touch": True, "locale": "zh-CN", "service_workers": "block", "accept_downloads": False})
         device["device_scale_factor"] = DEVICE_SCALE_FACTOR
-        context = await browser.new_context(**device)
-        pairs = parse_tieba_cookie_header(cookie)
+        try:
+            context = await browser.new_context(**device)
+        except Exception as exc:
+            raise TiebaBrowserUnavailable(
+                "浏览器上下文创建失败。",
+                reason="context_failed",
+                cookie_present=cookie_present,
+                bduss_found=bduss_found,
+                stoken_found=stoken_found,
+            ) from exc
         if pairs:
-            await context.add_cookies([{"name": name, "value": value, "url": f"https://{host}/", "httpOnly": True, "secure": True, "sameSite": "Lax"} for host in sorted(ALLOWED_TIEBA_HOSTS) for name, value in pairs])
-        page = await context.new_page(); page.set_default_timeout(timeout)
+            try:
+                await context.add_cookies([{"name": name, "value": value, "url": f"https://{host}/", "httpOnly": True, "secure": True, "sameSite": "Lax"} for host in sorted(ALLOWED_TIEBA_HOSTS) for name, value in pairs])
+            except Exception as exc:
+                raise TiebaBrowserUnavailable(
+                    "贴吧 Cookie 安装失败。",
+                    reason="cookie_install_failed",
+                    cookie_present=cookie_present,
+                    bduss_found=bduss_found,
+                    stoken_found=stoken_found,
+                ) from exc
+        try:
+            page = await context.new_page()
+            page.set_default_timeout(timeout)
+        except Exception as exc:
+            raise TiebaBrowserUnavailable(
+                "浏览器页面创建失败。",
+                reason="page_create_failed",
+                cookie_present=cookie_present,
+                bduss_found=bduss_found,
+                stoken_found=stoken_found,
+            ) from exc
         expected_id = _tieba_thread_id(url)
         if expected_id is None:
             raise TiebaBrowserUrlError("仅支持百度贴吧的 /p/数字 帖子链接。")
@@ -514,28 +709,103 @@ async def capture_tieba_webpage_screenshot(
                     await route.continue_()  # type: ignore[attr-defined]
             else:
                 await route.abort(error_code="blockedbyclient")  # type: ignore[attr-defined]
-        await page.route("**/*", route_handler)
+        try:
+            await page.route("**/*", route_handler)
+        except Exception as exc:
+            raise TiebaBrowserNavigationError(
+                "贴吧页面路由初始化失败。",
+                reason="route_setup_failed",
+                cookie_present=cookie_present,
+                bduss_found=bduss_found,
+                stoken_found=stoken_found,
+            ) from exc
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
         except Exception as exc:
-            raise TiebaBrowserTimeoutError("打开贴吧页面超时或失败，请稍后重试。") from exc
+            reason = (
+                "timeout"
+                if "timeout" in type(exc).__name__.lower()
+                else "navigation_failed"
+            )
+            error_type = (
+                TiebaBrowserTimeoutError if reason == "timeout" else TiebaBrowserNavigationError
+            )
+            raise error_type(
+                "打开贴吧页面超时或失败，请稍后重试。",
+                stage="navigation",
+                reason=reason,
+                cookie_present=cookie_present,
+                bduss_found=bduss_found,
+                stoken_found=stoken_found,
+            ) from exc
         if not _is_allowed_thread_document(page.url, expected_id):
-            raise TiebaBrowserNavigationError("贴吧页面跳转到了不受支持的地址。")
+            raise TiebaBrowserNavigationError(
+                "贴吧页面跳转到了不受支持的地址。",
+                reason="redirect",
+                cookie_present=cookie_present,
+                bduss_found=bduss_found,
+                stoken_found=stoken_found,
+            )
         try:
             info = await page.evaluate(_TRANSFORM_SCRIPT, {"sourceUrl": source_url, "suppliedTitle": str(title or "").strip()[:300], "suppliedAuthor": str(author or "").strip()[:120], "suppliedPublishedAt": str(published_at or "").strip()[:120]})
         except Exception as exc:
-            raise TiebaBrowserNavigationError("页面未找到可截图的贴吧 1 楼正文；请确认链接和 Cookie 有效。") from exc
+            raise TiebaBrowserNavigationError(
+                "页面未找到可截图的贴吧 1 楼正文；请确认链接和 Cookie 有效。",
+                stage="transform",
+                reason="missing_first_post",
+                cookie_present=cookie_present,
+                bduss_found=bduss_found,
+                stoken_found=stoken_found,
+            ) from exc
         if int(info.get("imageCount", 0)) > MAX_BROWSER_IMAGE_COUNT or int(info.get("nodeCount", 0)) > MAX_BROWSER_DOM_NODES:
-            raise TiebaBrowserNavigationError("帖子内容过大，已停止网页截图。")
+            raise TiebaBrowserNavigationError(
+                "帖子内容过大，已停止网页截图。",
+                stage="transform",
+                reason="content_limits",
+                cookie_present=cookie_present,
+                bduss_found=bduss_found,
+                stoken_found=stoken_found,
+            )
         try:
             state = await page.evaluate(_SCROLL_SCRIPT, {"maxImages": MAX_BROWSER_IMAGE_COUNT, "maxHeight": MAX_BROWSER_PAGE_HEIGHT, "perImageTimeoutMs": min(8_000, max(2_000, timeout // 8))})
-        except Exception:
-            state = {}
+        except Exception as exc:
+            raise TiebaBrowserNavigationError(
+                "页面内容准备失败。",
+                stage="transform",
+                reason="scroll_failed",
+                cookie_present=cookie_present,
+                bduss_found=bduss_found,
+                stoken_found=stoken_found,
+            ) from exc
         if bool(state.get("tooMany")) or bool(state.get("tooTall")) or int(state.get("pageHeight", 0)) > MAX_BROWSER_PAGE_HEIGHT:
-            raise TiebaBrowserNavigationError("帖子页面过长，已停止网页截图。")
-        stats = await page.evaluate(_FINALIZE_IMAGES_SCRIPT)
+            raise TiebaBrowserNavigationError(
+                "帖子页面过长，已停止网页截图。",
+                stage="transform",
+                reason="page_limits",
+                cookie_present=cookie_present,
+                bduss_found=bduss_found,
+                stoken_found=stoken_found,
+            )
+        try:
+            stats = await page.evaluate(_FINALIZE_IMAGES_SCRIPT)
+        except Exception as exc:
+            raise TiebaBrowserNavigationError(
+                "页面截图前整理失败。",
+                stage="transform",
+                reason="finalize_failed",
+                cookie_present=cookie_present,
+                bduss_found=bduss_found,
+                stoken_found=stoken_found,
+            ) from exc
         if int(stats.get("pageHeight", 0)) > MAX_BROWSER_PAGE_HEIGHT:
-            raise TiebaBrowserNavigationError("帖子页面过长，已停止网页截图。")
+            raise TiebaBrowserNavigationError(
+                "帖子页面过长，已停止网页截图。",
+                stage="transform",
+                reason="page_limits",
+                cookie_present=cookie_present,
+                bduss_found=bduss_found,
+                stoken_found=stoken_found,
+            )
         capture_height = int(stats.get("captureHeight", stats.get("pageHeight", 0)))
         current = screenshot_path
         if own_output or not current:
@@ -545,13 +815,61 @@ async def capture_tieba_webpage_screenshot(
         except TiebaBrowserCaptureError:
             raise
         except Exception as exc:
-            raise TiebaBrowserTimeoutError("生成贴吧网页截图超时或失败，请稍后重试。") from exc
+            reason = (
+                "timeout"
+                if "timeout" in type(exc).__name__.lower()
+                else "capture_failed"
+            )
+            error_type = (
+                TiebaBrowserTimeoutError if reason == "timeout" else TiebaBrowserCaptureError
+            )
+            raise error_type(
+                "生成贴吧网页截图超时或失败，请稍后重试。",
+                stage="capture",
+                reason=reason,
+                cookie_present=cookie_present,
+                bduss_found=bduss_found,
+                stoken_found=stoken_found,
+            ) from exc
         screenshot_paths.append(current)
+        try:
+            with Image.open(current) as raw_png:
+                raw_png_width, raw_png_height = raw_png.size
+        except Exception as exc:
+            raise TiebaBrowserCaptureError(
+                "生成的贴吧截图文件无效。",
+                stage="capture",
+                reason="invalid_png",
+                cookie_present=cookie_present,
+                bduss_found=bduss_found,
+                stoken_found=stoken_found,
+            ) from exc
         image_count = int(info.get("imageCount", 0)); loaded = int(stats.get("loaded", 0)); failed = int(stats.get("failed", 0)) + int(info.get("missingImageCount", 0))
         status = TiebaBrowserCaptureStatus.PARTIAL if failed or loaded < image_count else TiebaBrowserCaptureStatus.OK
         completed = True
-        return TiebaBrowserCaptureResult(current, source_url, str(info.get("title", "百度贴吧帖子")), image_count, loaded, failed, status, tuple(screenshot_paths))
-    except TiebaBrowserCaptureError:
+        return TiebaBrowserCaptureResult(
+            current,
+            source_url,
+            str(info.get("title", "百度贴吧帖子")),
+            image_count,
+            loaded,
+            failed,
+            status,
+            tuple(screenshot_paths),
+            cookie_present,
+            bduss_found,
+            stoken_found,
+            width,
+            DEVICE_SCALE_FACTOR,
+            raw_png_width,
+            raw_png_height,
+        )
+    except TiebaBrowserCaptureError as exc:
+        _attach_cookie_diagnostics(
+            exc,
+            cookie_present=cookie_present,
+            pairs=pairs,
+        )
         if own_output:
             for path in dict.fromkeys((*allocated, *screenshot_paths)):
                 try: os.remove(path)
@@ -562,7 +880,14 @@ async def capture_tieba_webpage_screenshot(
             for path in dict.fromkeys((*allocated, *screenshot_paths)):
                 try: os.remove(path)
                 except OSError: pass
-        raise TiebaBrowserCaptureError("浏览器截图失败，请检查浏览器环境后重试。") from exc
+        raise TiebaBrowserCaptureError(
+            "浏览器截图失败，请检查浏览器环境后重试。",
+            stage="capture",
+            reason="unexpected_failure",
+            cookie_present=cookie_present,
+            bduss_found=bduss_found,
+            stoken_found=stoken_found,
+        ) from exc
     finally:
         for resource in (page, context, browser):
             if resource is not None:
@@ -583,5 +908,5 @@ async def capture_tieba_screenshot(*args: object, **kwargs: object) -> str:
 
 
 __all__ = [
-    "TiebaBrowserCaptureError", "TiebaBrowserUnavailable", "TiebaBrowserUrlError", "TiebaBrowserNavigationError", "TiebaBrowserTimeoutError", "TiebaBrowserCaptureStatus", "TiebaBrowserCaptureResult", "capture_tieba_webpage_screenshot", "capture_tieba_screenshot", "normalize_tieba_browser_url", "normalize_tieba_url", "parse_tieba_cookie_header", "parse_tieba_browser_cookie_header", "_is_allowed_thread_document", "_is_allowed_style_request", "_is_allowed_image_request", "_playwright_proxy", "_TRANSFORM_SCRIPT", "_SCROLL_SCRIPT", "_FINALIZE_IMAGES_SCRIPT", "MAX_BROWSER_PAGE_HEIGHT", "MAX_BROWSER_IMAGE_COUNT", "MAX_BROWSER_DOM_NODES", "MAX_BROWSER_TOTAL_PIXELS",
+    "TiebaBrowserCaptureError", "TiebaBrowserCookieError", "TiebaBrowserUnavailable", "TiebaBrowserUrlError", "TiebaBrowserNavigationError", "TiebaBrowserTimeoutError", "TiebaBrowserCaptureStatus", "TiebaBrowserCaptureResult", "capture_tieba_webpage_screenshot", "capture_tieba_screenshot", "normalize_tieba_browser_url", "normalize_tieba_url", "parse_tieba_cookie_header", "parse_tieba_browser_cookie_header", "_is_allowed_thread_document", "_is_allowed_style_request", "_is_allowed_image_request", "_playwright_proxy", "_TRANSFORM_SCRIPT", "_SCROLL_SCRIPT", "_FINALIZE_IMAGES_SCRIPT", "MAX_BROWSER_PAGE_HEIGHT", "MAX_BROWSER_IMAGE_COUNT", "MAX_BROWSER_DOM_NODES", "MAX_BROWSER_TOTAL_PIXELS",
 ]

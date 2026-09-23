@@ -12,10 +12,13 @@ import unittest
 from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 from PIL import Image
 
 import tieba_browser
+import tieba_page
 
 
 def _pick(*names: str, required: bool = True):
@@ -103,6 +106,110 @@ class TiebaBrowserCookieTests(unittest.TestCase):
             with self.subTest(value=repr(value)):
                 with self.assertRaises(error):
                     parser(value)
+
+    def test_cookie_parser_ignores_unrelated_malformed_segments(self):
+        parser = tieba_browser.parse_tieba_cookie_header
+        pairs = parser(
+            "BAIDUID=tracking; !!!=odd-name; unrelated-bare; =no-name; "
+            "BDUSS=bduss-value; STOKEN=stoken-value; Secure; $Version=1"
+        )
+        self.assertEqual(
+            pairs,
+            [("BDUSS", "bduss-value"), ("STOKEN", "stoken-value")],
+        )
+
+    def test_cookie_parser_accepts_many_unrelated_browser_cookies(self):
+        unrelated = "; ".join(
+            f"BAIDU_FIELD_{index}=value-{index}" for index in range(20)
+        )
+        pairs = tieba_browser.parse_tieba_cookie_header(
+            f"{unrelated}; BDUSS=bduss-value; STOKEN=stoken-value"
+        )
+        self.assertEqual(
+            pairs,
+            [("BDUSS", "bduss-value"), ("STOKEN", "stoken-value")],
+        )
+
+    def test_cookie_parser_rejects_nul_in_bduss(self):
+        with self.assertRaises(tieba_browser.TiebaBrowserCookieError) as caught:
+            tieba_browser.parse_tieba_cookie_header("STOKEN=y; BDUSS=bad\x00value")
+        self.assertEqual(caught.exception.reason, "nul_value")
+        self.assertEqual(caught.exception.segment_index, 1)
+
+    def test_cookie_parser_reports_missing_bduss_separately(self):
+        with self.assertRaises(tieba_browser.TiebaBrowserCookieError) as caught:
+            tieba_browser.parse_tieba_cookie_header("STOKEN=stoken-value; BAIDUID=x")
+        self.assertEqual(str(caught.exception), "贴吧 Cookie 中未找到 BDUSS。")
+        self.assertEqual(caught.exception.stage, "cookie_parse")
+        self.assertEqual(caught.exception.reason, "missing_bduss")
+        self.assertFalse(caught.exception.bduss_found)
+        self.assertTrue(caught.exception.stoken_found)
+
+    def test_browser_and_api_parsers_extract_the_same_bduss(self):
+        raw = "BAIDUID=tracking; malformed; BDUSS=shared-bduss; STOKEN=shared-stoken"
+        browser_pairs = dict(tieba_browser.parse_tieba_cookie_header(raw))
+        api_credentials = tieba_page.parse_tieba_cookie(raw)
+        self.assertEqual(browser_pairs["BDUSS"], api_credentials.bduss)
+        self.assertEqual(browser_pairs["STOKEN"], api_credentials.stoken)
+
+    def test_capture_injects_only_bduss_and_stoken_into_tieba_context(self):
+        page = SimpleNamespace(
+            main_frame=object(),
+            url="https://tieba.baidu.com/p/123",
+            route=AsyncMock(),
+            goto=AsyncMock(),
+            close=AsyncMock(),
+            set_default_timeout=lambda _timeout: None,
+        )
+
+        async def evaluate(script, *_args):
+            if script == tieba_browser._TRANSFORM_SCRIPT:
+                return {"title": "fixture", "imageCount": 0, "nodeCount": 0}
+            if script == tieba_browser._SCROLL_SCRIPT:
+                return {"pageHeight": 100, "tooMany": False, "tooTall": False}
+            if script == tieba_browser._FINALIZE_IMAGES_SCRIPT:
+                return {"pageHeight": 100, "captureHeight": 100, "loaded": 0, "failed": 0}
+            return {}
+
+        page.evaluate = evaluate
+        context = SimpleNamespace(
+            add_cookies=AsyncMock(),
+            new_page=AsyncMock(return_value=page),
+            close=AsyncMock(),
+        )
+        browser = SimpleNamespace(
+            new_context=AsyncMock(return_value=context),
+            close=AsyncMock(),
+        )
+        playwright = SimpleNamespace(
+            chromium=SimpleNamespace(launch=AsyncMock(return_value=browser)),
+            devices={},
+            stop=AsyncMock(),
+        )
+        starter = SimpleNamespace(start=AsyncMock(return_value=playwright))
+
+        async def write_png(_page, output_path, **_kwargs):
+            with Image.new("RGB", (780, 200), "white") as image:
+                image.save(output_path, format="PNG")
+
+        with TemporaryDirectory() as directory, patch.object(
+            tieba_browser, "async_playwright", return_value=starter
+        ), patch.object(
+            tieba_browser, "_capture_mobile_page_tiles", new=AsyncMock(side_effect=write_png)
+        ):
+            result = asyncio.run(
+                tieba_browser.capture_tieba_webpage_screenshot(
+                    "https://tieba.baidu.com/p/123",
+                    cookie="BDUSS=bduss-value; OTHER=other-value; malformed; STOKEN=stoken-value",
+                    output_path=Path(directory) / "capture.png",
+                )
+            )
+
+        installed = context.add_cookies.await_args.args[0]
+        self.assertEqual({item["name"] for item in installed}, {"BDUSS", "STOKEN"})
+        self.assertEqual({item["value"] for item in installed}, {"bduss-value", "stoken-value"})
+        self.assertEqual({item["url"] for item in installed}, {"https://tieba.baidu.com/", "https://www.tieba.baidu.com/"})
+        self.assertEqual((result.raw_png_width, result.raw_png_height), (780, 200))
 
 
 class TiebaBrowserRoutingContractTests(unittest.TestCase):
@@ -347,6 +454,23 @@ class TiebaBrowserTileContractTests(unittest.TestCase):
                     )
                 )
         self.assertTrue(any("scrollTo(0, 0)" in script for script in page.evaluated))
+
+    def test_native_dpr_dimension_failure_is_classified_as_capture(self):
+        page = _FakeTilePage(width=5)
+        with TemporaryDirectory() as directory:
+            with self.assertRaises(tieba_browser.TiebaBrowserCaptureError) as caught:
+                asyncio.run(
+                    self.capture_tiles(
+                        page,
+                        str(Path(directory) / "failed-dimensions.png"),
+                        width=4,
+                        viewport_height=3,
+                        page_height=3,
+                        timeout_ms=1000,
+                    )
+                )
+        self.assertEqual(caught.exception.stage, "capture")
+        self.assertEqual(caught.exception.reason, "dimensions")
 
 
 class TiebaBrowserRuntimeBehaviorTests(unittest.TestCase):

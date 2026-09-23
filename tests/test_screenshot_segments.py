@@ -416,6 +416,11 @@ class BrowserContextDprTests(unittest.TestCase):
                                     viewport_width=css_width,
                                     viewport_height=844,
                                     timeout_ms=5000,
+                                    **(
+                                        {"cookie": "BDUSS=fixture"}
+                                        if module is tieba_browser
+                                        else {}
+                                    ),
                                 )
                             )
 

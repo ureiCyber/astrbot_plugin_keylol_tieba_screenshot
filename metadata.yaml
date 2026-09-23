@@ -6,7 +6,7 @@ desc: |
   与 QQ 分享卡片，获取标题、作者、发布时间及完整主楼内容。其乐优先使用受控浏览器网页截图，
   贴吧也优先使用受控浏览器真实网页截图，验证码、反爬或 DOM 不兼容等情况回退安全清洗后的 HTML；
   网页截图采用原生 DPR2 无损分段拼接，统一安全编码后发送 JPEG；目录分图仅适用于其乐。
-version: 0.5.3
+version: 0.5.4
 author: キツネの嫁入り
 repo: https://github.com/ureiCyber/astrbot_plugin_keylol_tieba_screenshot
 astrbot_version: ">=4.0.0"

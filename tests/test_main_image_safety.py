@@ -145,6 +145,26 @@ class ImageChainSafetyTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(all(not Path(path).exists() for path in paths))
                 self.assertFalse(plugin._owned_capture_paths)
 
+    async def test_send_boundary_logs_renderer_and_safety_dimensions(self):
+        with TemporaryDirectory() as directory:
+            plugin = self.plugin()
+            playwright_path = write_png(Path(directory) / "playwright.png", (880, 100))
+            html_path = write_png(Path(directory) / "html.png", (440, 100))
+            plugin._owned_capture_paths.add(playwright_path)
+            with patch.object(main.logger, "info") as info, patch.object(
+                main.Comp.Image, "fromBytes", side_effect=component, create=True
+            ):
+                await plugin._prepare_image_chain([playwright_path, html_path])
+
+            text = "\n".join(str(call.args[0]) for call in info.call_args_list)
+            self.assertIn("source_renderer=playwright", text)
+            self.assertIn("source_renderer=html_fallback", text)
+            self.assertIn("source_width=880, source_height=100", text)
+            self.assertIn("source_width=440, source_height=100", text)
+            self.assertIn("final_width=880, final_height=100", text)
+            self.assertIn("final_width=440, final_height=100", text)
+            self.assertIn("safety_resize=False", text)
+
     async def test_one_invalid_toc_image_prevents_the_whole_site_chain_and_cleans_all_owned_files(self):
         with TemporaryDirectory() as directory:
             plugin = self.plugin()
@@ -221,7 +241,11 @@ class ImageChainSafetyTests(unittest.IsolatedAsyncioTestCase):
                         return {}
 
                     page.evaluate = AsyncMock(side_effect=evaluate)
-                    context = SimpleNamespace(new_page=AsyncMock(return_value=page), close=AsyncMock())
+                    context = SimpleNamespace(
+                        add_cookies=AsyncMock(),
+                        new_page=AsyncMock(return_value=page),
+                        close=AsyncMock(),
+                    )
                     browser = SimpleNamespace(new_context=AsyncMock(return_value=context), close=AsyncMock())
                     playwright = SimpleNamespace(
                         chromium=SimpleNamespace(launch=AsyncMock(return_value=browser)),
@@ -244,8 +268,12 @@ class ImageChainSafetyTests(unittest.IsolatedAsyncioTestCase):
                         patch.object(module, "_capture_mobile_page_tiles", AsyncMock(side_effect=asyncio.CancelledError)),
                     ):
                         with self.assertRaises(asyncio.CancelledError):
+                            capture_kwargs = {
+                                "cookie": "BDUSS=fixture",
+                            } if site == "tieba" else {}
                             await getattr(module, f"capture_{site}_webpage_screenshot")(
                                 url, output_path=None if own_output else caller_path,
+                                **capture_kwargs,
                             )
                     self.assertEqual(bool(allocated), own_output)
                     self.assertTrue(all(not Path(path).exists() for path in allocated))
