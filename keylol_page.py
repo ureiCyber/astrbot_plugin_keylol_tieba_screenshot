@@ -15,10 +15,14 @@ from PIL import Image, ImageChops
 
 try:
     from .safe_media import SafeMediaDownloader, is_public_https_url
-    from .keylol_embeds import render_embed
+    from .keylol_embeds import (
+        EMBED_CARD_CSS, classify_embed, normalize_steam_widget_url, render_embed,
+    )
 except ImportError:
     from safe_media import SafeMediaDownloader, is_public_https_url
-    from keylol_embeds import render_embed
+    from keylol_embeds import (
+        EMBED_CARD_CSS, classify_embed, normalize_steam_widget_url, render_embed,
+    )
 
 
 DEFAULT_URL = "https://keylol.com/t1046223-1-1"
@@ -298,22 +302,6 @@ def _absolute_http_url(value: str, base_url: str) -> str | None:
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         return None
     return absolute
-
-
-def _normalize_steam_widget_url(value: str) -> str | None:
-    """Use the shared strict Steam provider classifier when it is available."""
-
-    try:
-        from .keylol_embeds import normalize_steam_widget_url
-    except ImportError:
-        try:
-            from keylol_embeds import normalize_steam_widget_url
-        except ImportError:
-            return None
-    try:
-        return normalize_steam_widget_url(value)
-    except Exception:
-        return None
 
 
 def _is_image_placeholder(source: str) -> bool:
@@ -622,8 +610,9 @@ def _replace_embedded_media(document: BeautifulSoup, root: Tag, base_url: str) -
             continue
         raw_url = str(media.get("src") or media.get("data") or "").strip()
         absolute_url = _absolute_http_url(raw_url, base_url) if raw_url else None
-        widget_url = _normalize_steam_widget_url(absolute_url) if absolute_url else None
-        if widget_url:
+        provider = classify_embed(absolute_url)
+        if provider == "steam_widget":
+            widget_url = normalize_steam_widget_url(absolute_url)
             figure = document.new_tag("figure")
             figure["class"] = ["media-card", "media-card-embed", "media-card-steam"]
             figure["data-keylol-embed-url"] = widget_url
@@ -635,6 +624,15 @@ def _replace_embedded_media(document: BeautifulSoup, root: Tag, base_url: str) -
             note.string = "（静态信息正在加载）"
             caption.append(note)
             figure.append(caption)
+            media.replace_with(figure)
+            continue
+
+        if provider == "keylol_video":
+            # The iframe and video URLs are never fetched. A trusted preview,
+            # when present, is resolved by the cookie-free embed renderer later.
+            figure = _media_card(document, kind="video", source_url=base_url)
+            figure["class"] += ["media-card-embed", "media-card-keylol-video"]
+            figure["data-keylol-embed-url"] = absolute_url
             media.replace_with(figure)
             continue
 
@@ -1336,6 +1334,7 @@ def build_render_html(
     .media-card img {{ display: block; margin: 0 auto 10px; }}
     .media-card figcaption {{ color: #525b66; font-size: 15px; line-height: 1.55; }}
     .media-card figcaption strong {{ color: #20242a; }}
+    {EMBED_CARD_CSS if article.embed_count else ""}
     .article-notice {{ margin: 0 0 16px; padding-left: 10px; color: #525b66; border-left: 3px solid #aeb5bd; }}
     .access-note {{ margin: 0 16px 16px; padding: 10px 0; color: #666; font-size: 15px; border-top: 1px solid #e7eaee; border-bottom: 1px solid #e7eaee; }}
     .source {{ padding: 12px 16px 16px; color: #7a838e; font-size: 13px; border-top: 1px solid #e7eaee; overflow-wrap: anywhere; }}

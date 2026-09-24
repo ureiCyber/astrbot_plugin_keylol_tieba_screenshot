@@ -21,7 +21,7 @@ from urllib.parse import parse_qsl, urlencode, urlparse
 
 try:
     from .safe_media import SafeMediaDownloader, is_public_https_url
-    from .keylol_embeds import render_embed
+    from .keylol_embeds import EMBED_CARD_CSS, render_embed
     from .screenshot_capture import (
         DEVICE_SCALE_FACTOR,
         ScreenshotCaptureError,
@@ -29,7 +29,7 @@ try:
     )
 except ImportError:  # Direct execution from the plugin directory.
     from safe_media import SafeMediaDownloader, is_public_https_url
-    from keylol_embeds import render_embed
+    from keylol_embeds import EMBED_CARD_CSS, render_embed
     from screenshot_capture import (  # type: ignore[no-redef]
         DEVICE_SCALE_FACTOR,
         ScreenshotCaptureError,
@@ -500,6 +500,7 @@ async ({sourceUrl, viewportWidth, suppliedTitle, suppliedAuthor, suppliedPublish
     .keylol-capture-footer a { display: block; color: #1769aa; text-decoration: none; }
     .keylol-browser-media-card { margin: 12px 0; padding: 12px; border: 1px solid #dfe3e8; border-radius: 6px; background: #f6f8fa; color: #59636e; font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; }
     .keylol-browser-image-failed { border-color: #efd4d4; background: #fff7f7; color: #9a3b3b; }
+    /* KEYLOL_EMBED_CARD_CSS */
   `;
   const previousStyle = document.getElementById("keylol-browser-capture-style"); if (previousStyle) previousStyle.remove(); document.head.append(style);
   const embeds = [];
@@ -544,7 +545,7 @@ async ({sourceUrl, viewportWidth, suppliedTitle, suppliedAuthor, suppliedPublish
   }
   return {title, imageCount, sourceImageCount, missingImageCount, externalImageCount, missingExternalImageCount, externalSources, embeds, autoExpandedCollapseCount, nodeCount: article.querySelectorAll("*").length};
 }
-"""
+""".replace("/* KEYLOL_EMBED_CARD_CSS */", EMBED_CARD_CSS)
 
 
 _SCROLL_SCRIPT = r"""

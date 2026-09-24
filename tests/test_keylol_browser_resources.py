@@ -3,12 +3,16 @@ import asyncio
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import urlparse
 import unittest
 from unittest.mock import AsyncMock, patch
 
+from bs4 import BeautifulSoup
 from PIL import Image
 
 import keylol_browser as browser
+from keylol_embeds import render_embed
+from safe_media import SafeHtml
 
 
 def tiny_png():
@@ -39,6 +43,7 @@ class BrowserResourceBehaviorTests(unittest.IsolatedAsyncioTestCase):
         })
         self.page = await self.context.new_page()
         self.requests = []
+        self.aborted_requests = []
         self.fixture = (Path(__file__).parent / 'fixtures/keylol_resources.html').read_text(encoding='utf-8')
 
         async def route_handler(route, request):
@@ -46,6 +51,7 @@ class BrowserResourceBehaviorTests(unittest.IsolatedAsyncioTestCase):
             if request.url == 'https://keylol.com/t1-1-1':
                 await route.fulfill(content_type='text/html; charset=utf-8', body=self.fixture)
             else:
+                self.aborted_requests.append((request.url, request.resource_type))
                 await route.abort()
         await self.page.route('**/*', route_handler)
         await self.page.goto('https://keylol.com/t1-1-1', wait_until='domcontentloaded', timeout=5000)
@@ -114,6 +120,100 @@ class BrowserResourceBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(info['missingImageCount'], 1)
         self.assertTrue(all(not browser.is_public_https_url(url) for url in info['externalSources']))
         self.assertEqual(info['externalImageCount'], 4)
+
+    async def test_live_embed_fixture_runs_through_static_provider_cards_without_media_requests(self):
+        thread_url = 'https://keylol.com/t1050511-1-1?mobile=no'
+        embed_fixture = BeautifulSoup(
+            (Path(__file__).parent / 'fixtures/keylol_t1050511_embeds.html').read_text(encoding='utf-8'),
+            'html.parser',
+        )
+        post_shell = embed_fixture.select_one('#post_1')
+        self.assertIsNotNone(post_shell)
+        post_number = post_shell.select_one('#postnum1').extract()
+        post_content = post_shell.select_one('#postmessage_1').extract()
+        article = embed_fixture.new_tag('article', id='post_1', attrs={'class': ['plc']})
+        message = embed_fixture.new_tag('div', attrs={'class': ['message']})
+        article.append(post_number)
+        message.append(post_content)
+        article.append(message)
+        post_shell.replace_with(article)
+        fixture_html = str(embed_fixture)
+
+        async def serve_embed_fixture(route, _request):
+            await route.fulfill(content_type='text/html; charset=utf-8', body=fixture_html)
+
+        await self.page.route(thread_url, serve_embed_fixture)
+        self.requests.clear()
+        self.aborted_requests.clear()
+        await self.page.goto(thread_url, wait_until='domcontentloaded', timeout=5000)
+
+        steam_fixture = (
+            Path(__file__).parent / 'fixtures/steam_widget_provider_error.html'
+        ).read_bytes()
+
+        class FixtureDownloader:
+            def __init__(self):
+                self.html_calls = []
+                self.image_calls = []
+
+            async def fetch_html(self, url, *, allowed_url, max_bytes, **_kwargs):
+                self.html_calls.append((url, allowed_url(url), max_bytes))
+                return SafeHtml(steam_fixture, 'text/html')
+
+            async def fetch_image(self, url, *, allowed_url, max_bytes, **_kwargs):
+                self.image_calls.append((url, allowed_url(url), max_bytes))
+                return None
+
+        downloader = FixtureDownloader()
+        info = await self.page.evaluate(browser._TRANSFORM_SCRIPT, {
+            'sourceUrl': thread_url, 'viewportWidth': 390,
+            'suppliedTitle': '', 'suppliedAuthor': '', 'suppliedPublishedAt': '',
+            'sectionTitle': '', 'hideToc': True,
+        })
+        self.assertEqual(len(info['embeds']), 7)
+
+        results = []
+        for embed in info['embeds']:
+            result = await render_embed(embed['url'], downloader)
+            results.append(result)
+            installed = await self.page.evaluate(
+                browser._INSTALL_EMBED_SCRIPT,
+                {'index': int(embed['index']), 'html': result.html},
+            )
+            self.assertTrue(installed)
+
+        self.assertEqual([result.status for result in results].count('provider_error'), 1)
+        self.assertEqual([result.status for result in results].count('success'), 6)
+        self.assertEqual(len(downloader.html_calls), 1)
+        self.assertTrue(all(allowed for _, allowed, _ in downloader.html_calls))
+        self.assertEqual(downloader.image_calls, [], 'No Steam error image or video poster is present')
+
+        self.assertEqual(await self.page.locator('[data-keylol-embed-provider="steam"]').count(), 1)
+        self.assertEqual(await self.page.locator('[data-keylol-embed-provider="keylol_video"]').count(), 6)
+        self.assertIn('错误', await self.page.locator('.keylol-steam-widget-error-title').inner_text())
+        self.assertIn('无法读取这件物品的信息。', await self.page.locator('.keylol-steam-widget-error-message').inner_text())
+        self.assertEqual(await self.page.locator('.media-card-video').count(), 6)
+        self.assertEqual(await self.page.locator('.keylol-browser-embed-fallback').count(), 0)
+        self.assertNotIn('外部嵌入内容', await self.page.locator('article.plc').inner_text())
+        self.assertEqual(await self.page.locator('iframe, object, embed, video, script').count(), 0)
+
+        installed_html = await self.page.locator('[data-keylol-embed]').evaluate_all(
+            '(nodes) => nodes.map((node) => node.outerHTML)'
+        )
+        for card_html in installed_html:
+            card = BeautifulSoup(card_html, 'html.parser')
+            self.assertIsNone(card.find(['script', 'iframe', 'object', 'embed', 'video']))
+            for node in card.find_all(True):
+                self.assertFalse(any(name.lower().startswith('on') for name in node.attrs))
+
+        embed_urls = {embed['url'] for embed in info['embeds']}
+        aborted_documents = {
+            url for url, resource_type in self.aborted_requests if resource_type == 'document'
+        }
+        self.assertTrue(embed_urls.issubset(aborted_documents))
+        requested_hosts = {urlparse(url).hostname for url, _ in self.requests}
+        self.assertNotIn('shared.akamai.steamstatic.com', requested_hosts)
+        self.assertNotIn('video.akamai.steamstatic.com', requested_hosts)
 
 
 class ExternalFulfillTests(unittest.IsolatedAsyncioTestCase):

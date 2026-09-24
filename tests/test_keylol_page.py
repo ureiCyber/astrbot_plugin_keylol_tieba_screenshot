@@ -3,9 +3,12 @@ import unittest
 from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import AsyncMock
 
 from bs4 import BeautifulSoup
 from PIL import Image, ImageDraw
+
+from safe_media import SafeHtml
 
 from keylol_page import (
     Article,
@@ -17,6 +20,7 @@ from keylol_page import (
     _desktop_view_url,
     _inline_keylol_images,
     _inline_external_images,
+    _inline_embeds,
     build_render_html,
     extract_keylol_thread_urls,
     mobile_viewport_height,
@@ -442,6 +446,89 @@ class KeylolPageTests(unittest.TestCase):
             )
         )
         self.assertIn("打开原帖查看媒体", inlined.body_html)
+
+    def test_observed_keylol_embeds_keep_video_classification_through_inlining(self):
+        fixture = (Path(__file__).parent / "fixtures/keylol_t1050511_embeds.html").read_text(
+            encoding="utf-8"
+        )
+        article = parse_article(fixture, "https://keylol.com/t1050511-1-1")
+        self.assertEqual(article.embed_count, 7)
+        self.assertEqual(article.fallback_embed_count, 0)
+        body = BeautifulSoup(article.body_html, "html.parser")
+        self.assertEqual(len(body.select(".media-card-keylol-video")), 6)
+        self.assertNotIn("外部嵌入内容", body.get_text())
+        downloader = type("Downloader", (), {})()
+        downloader.fetch_image = AsyncMock(return_value=None)
+        # A real signature is required so redirect policy enforcement cannot
+        # silently disappear behind **kwargs in a test double.
+        calls = []
+
+        async def fetch_html(url, *, allowed_url, max_bytes):
+            calls.append(url)
+            return None
+
+        downloader.fetch_html = fetch_html
+        result = asyncio.run(_inline_embeds(article, downloader))
+        body = BeautifulSoup(result.body_html, "html.parser")
+        self.assertEqual(calls, ["https://store.steampowered.com/widget/4813850/"])
+        downloader.fetch_image.assert_not_awaited()
+        self.assertEqual(len(body.select('[data-keylol-embed-provider="keylol_video"]')), 6)
+        self.assertEqual(body.get_text().count("Steam 视频"), 6)
+        self.assertNotIn("外部嵌入内容", body.get_text())
+        self.assertEqual(result.loaded_embed_count, 6)
+        self.assertEqual(result.fallback_embed_count, 1)
+        self.assertIsNone(body.find(["script", "iframe", "object", "embed", "video", "source"]))
+        self.assertFalse(any(name.lower().startswith("on") for node in body.find_all(True) for name in node.attrs))
+
+    def test_malicious_and_unknown_iframes_never_reach_the_downloader(self):
+        payload = """
+        <a id="thread_subject">embed safety</a>
+        <div id="post_1"><a id="postnum1"><em>1</em></a>
+        <td id="postmessage_1">
+          <iframe src="https://127.0.0.1/private" onload="alert(1)"></iframe>
+          <object data="https://example.org/unknown"><embed src="https://localhost/test"></object>
+          <iframe src="https://keylol.com.evil.org/source/plugin/onexin_html5player/open/videojs/html5player.html?mp4=https://localhost/a.mp4"></iframe>
+        </td></div>
+        """
+        article = parse_article(payload, "https://keylol.com/t1-1-1")
+        downloader = type("Downloader", (), {
+            "fetch_html": AsyncMock(), "fetch_image": AsyncMock(),
+        })()
+        result = asyncio.run(_inline_embeds(article, downloader))
+        self.assertEqual(result.embed_count, 3)
+        self.assertEqual(result.fallback_embed_count, 3)
+        self.assertEqual(result.loaded_embed_count, 0)
+        self.assertEqual(result.body_html.count("外部嵌入内容"), 3)
+        downloader.fetch_html.assert_not_awaited()
+        downloader.fetch_image.assert_not_awaited()
+        self.assertNotIn("onload", result.body_html)
+        self.assertNotIn("127.0.0.1", result.body_html)
+
+    def test_provider_error_is_preserved_by_the_complete_article_pipeline(self):
+        fixture_dir = Path(__file__).parent / "fixtures"
+        article = parse_article(
+            (fixture_dir / "keylol_t1050511_embeds.html").read_text(encoding="utf-8"),
+            "https://keylol.com/t1050511-1-1",
+        )
+        error_page = (fixture_dir / "steam_widget_provider_error.html").read_bytes()
+
+        class Downloader:
+            async def fetch_html(self, url, *, allowed_url, max_bytes):
+                return SafeHtml(error_page, "text/html")
+
+            async def fetch_image(self, *args, **kwargs):
+                raise AssertionError("This post's embeds have no images to download")
+
+        result = asyncio.run(_inline_embeds(article, Downloader()))
+        document = build_render_html(result)
+        body = BeautifulSoup(result.body_html, "html.parser")
+        self.assertIn("无法读取这件物品的信息。", body.get_text())
+        self.assertNotIn("静态截图无法完整加载", document)
+        self.assertNotIn("外部嵌入内容", document)
+        self.assertEqual(result.loaded_embed_count, 7)
+        self.assertEqual(result.fallback_embed_count, 0)
+        self.assertEqual(len(body.select('[data-keylol-embed-status="provider_error"]')), 1)
+        self.assertEqual(len(body.select('[data-keylol-embed-provider="keylol_video"]')), 6)
 
     def test_inlines_binary_attachment_with_cookie_referer_and_proxy(self):
         article = Article(

@@ -13,8 +13,8 @@ import html
 import inspect
 import re
 from dataclasses import dataclass
-from typing import Callable, Mapping
-from urllib.parse import parse_qsl, urlsplit
+from typing import Callable, Literal, Mapping
+from urllib.parse import SplitResult, parse_qsl, urlsplit
 
 from bs4 import BeautifulSoup, Tag
 
@@ -44,15 +44,68 @@ _STEAM_IMAGE_PATH_RE = re.compile(
 _CACHE_QUERY_RE = re.compile(r"^t=[0-9]{1,20}$")
 _DISCOUNT_RE = re.compile(r"(?:-|−)\s*\d{1,3}\s*%")
 
+# Fixed local styling for the rebuilt embed cards. Callers should append
+# this to their render stylesheet; it contains no provider CSS or resources.
+EMBED_CARD_CSS = """
+.keylol-steam-widget-error {
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  min-height: 78px;
+  margin: 12px 0;
+  padding: 14px 18px;
+  border: 1px solid #2c4358;
+  border-radius: 3px;
+  background: linear-gradient(110deg, #1b2838 0%, #213449 100%);
+  color: #c7d5e0;
+  font: 14px/1.5 Arial, Helvetica, sans-serif;
+}
+.keylol-steam-widget-error-content { min-width: 0; }
+.keylol-steam-widget-error-title {
+  display: block;
+  margin: 0 0 4px;
+  color: #fff;
+  font-size: 16px;
+  font-weight: 700;
+}
+.keylol-steam-widget-error-message { margin: 0; }
+.keylol-steam-widget-error-code {
+  display: block;
+  margin-top: 5px;
+  color: #8f98a0;
+  font-size: 12px;
+}
+.keylol-video-embed img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  margin: 0 0 10px;
+}
+"""
+
 
 @dataclass(frozen=True)
 class EmbedRenderResult:
-    """Sanitized HTML and loading state for one embedded resource."""
+    """Sanitized HTML and provider/fetch state for one embedded resource."""
 
     html: str
-    loaded: bool
-    fallback: bool
+    status: Literal["success", "provider_error", "fetch_fallback"]
     provider: str | None
+    partial: bool = False
+
+    @property
+    def loaded(self) -> bool:
+        """Whether a provider-specific static card was successfully built."""
+
+        return self.status == "provider_error" or (
+            self.status == "success" and not self.partial
+        )
+
+    @property
+    def fallback(self) -> bool:
+        """Compatibility flag for callers that track fallback embed cards."""
+
+        return self.status == "fetch_fallback" or self.partial
 
 
 def normalize_steam_widget_url(value: object) -> str | None:
@@ -301,6 +354,64 @@ def _steam_widget_fields(document: BeautifulSoup, app_id: str) -> dict[str, str]
     }
 
 
+def _plain_node_text(node: Tag, limit: int) -> str:
+    """Extract bounded visible text without carrying source markup forward."""
+
+    fragment = BeautifulSoup(str(node), "html.parser")
+    for hidden in fragment.select("script, style, template, noscript, iframe, object, embed"):
+        hidden.decompose()
+    return _clean_text(fragment.get_text(" ", strip=True), limit)
+
+
+def _steam_provider_error_fields(document: BeautifulSoup) -> dict[str, str] | None:
+    """Recognize the confirmed Steam widget error structure using text only.
+
+    Steam's live 4813850 widget response was HTTP 200 HTML with the localized
+    error heading in ``#widget .header_container > h1.main_text`` and its
+    description in ``#widget .desc``. The app ID is not present in the body;
+    optional ``#<digits>`` error codes are handled generically if Steam adds
+    one to the description in another response.
+    """
+
+    heading = document.select_one("#widget .header_container > h1.main_text")
+    description_node = document.select_one("#widget .desc")
+    if heading is None or description_node is None:
+        return None
+    title = _plain_node_text(heading, 80)
+    description = _plain_node_text(description_node, 400)
+    if title.casefold() not in {"错误", "error"} or not description:
+        return None
+
+    code_match = re.search(r"(?<!\w)#([0-9]{1,20})(?![0-9])", description)
+    code = f"#{code_match.group(1)}" if code_match else ""
+    if code_match:
+        description = _clean_text(
+            description[: code_match.start()] + description[code_match.end() :], 400
+        )
+    return {"title": title, "description": description, "code": code}
+
+
+def _steam_provider_error_card_html(fields: Mapping[str, str]) -> str:
+    title = html.escape(fields.get("title", "错误"), quote=True)
+    description = html.escape(fields.get("description", ""), quote=True)
+    code_text = fields.get("code", "")
+    code = (
+        f'<span class="keylol-steam-widget-error-code">'
+        f"{html.escape(code_text, quote=True)}</span>"
+        if code_text
+        else ""
+    )
+    return (
+        '<article class="keylol-browser-media-card keylol-steam-widget-error" '
+        'data-keylol-embed-provider="steam" '
+        'data-keylol-embed-status="provider_error">'
+        '<div class="keylol-steam-widget-error-content">'
+        f'<strong class="keylol-steam-widget-error-title">{title}</strong>'
+        f'<p class="keylol-steam-widget-error-message">{description}</p>'
+        f"{code}</div></article>"
+    )
+
+
 def _sniff_image(data: bytes, content_type: str) -> str | None:
     """Accept only static raster formats whose bytes match their declared MIME."""
 
@@ -328,7 +439,8 @@ def _fallback_html(provider: str | None) -> str:
     title = "Steam 商店内容" if provider == "steam" else "外部嵌入内容"
     return (
         '<div class="keylol-browser-media-card keylol-browser-embed-fallback" '
-        f'data-keylol-embed-provider="{provider or "unknown"}">'
+        f'data-keylol-embed-provider="{provider or "unknown"}" '
+        'data-keylol-embed-status="fetch_fallback">'
         f"<strong>{title}</strong>"
         "<span>（静态截图无法完整加载）</span>"
         "</div>"
@@ -377,7 +489,8 @@ def _steam_card_html(
         )
     return (
         '<article class="keylol-browser-media-card keylol-browser-steam-embed" '
-        'data-keylol-embed-provider="steam">'
+        'data-keylol-embed-provider="steam" '
+        'data-keylol-embed-status="success">'
         f'{image}<div class="keylol-steam-embed-content"><strong>{name}</strong>'
         + "".join(details)
         + "</div></article>"
@@ -390,7 +503,7 @@ async def render_embed(
     *,
     fetch: bool = True,
 ) -> EmbedRenderResult:
-    """Render a safe static card for a Steam widget or unknown embed.
+    """Render a provider-specific static card, or a visible unknown fallback.
 
     downloader is the shared safe_media downloader. It must provide
     fetch_html/fetch_image methods accepting an allowed_url callback. Returning
@@ -398,14 +511,23 @@ async def render_embed(
     requests are used here.
     """
 
-    canonical_url = normalize_steam_widget_url(url)
-    if canonical_url is None:
+    provider = classify_embed(url)
+    if provider == "keylol_video":
         return EmbedRenderResult(
-            html=_fallback_html(None), loaded=False, fallback=True, provider=None
+            html=await _keylol_video_card_html(
+                _keylol_video_fields(url) or {}, downloader, fetch=fetch
+            ),
+            status="success",
+            provider="keylol_video",
         )
+    if provider == "unknown":
+        return EmbedRenderResult(
+            html=_fallback_html(None), status="fetch_fallback", provider=None
+        )
+    canonical_url = normalize_steam_widget_url(url)
     if not fetch or downloader is None:
         return EmbedRenderResult(
-            html=_fallback_html("steam"), loaded=False, fallback=True, provider="steam"
+            html=_fallback_html("steam"), status="fetch_fallback", provider="steam"
         )
 
     app_id = _steam_app_id(canonical_url)
@@ -429,15 +551,31 @@ async def render_embed(
         )
     ):
         return EmbedRenderResult(
-            html=_fallback_html("steam"), loaded=False, fallback=True, provider="steam"
+            html=_fallback_html("steam"), status="fetch_fallback", provider="steam"
         )
 
     try:
         document = BeautifulSoup(page_result[0], "html.parser")
+        provider_error = _steam_provider_error_fields(document)
+        if provider_error is not None:
+            return EmbedRenderResult(
+                html=_steam_provider_error_card_html(provider_error),
+                status="provider_error",
+                provider="steam",
+            )
         fields = _steam_widget_fields(document, app_id)
     except Exception:
         return EmbedRenderResult(
-            html=_fallback_html("steam"), loaded=False, fallback=True, provider="steam"
+            html=_fallback_html("steam"), status="fetch_fallback", provider="steam"
+        )
+
+    # A Steam product title is needed to distinguish a parsed product widget
+    # from an unrecognized/changed response. Artwork remains optional: the
+    # existing partial-card path preserves safe product text when its image
+    # cannot be fetched or validated.
+    if not fields.get("name"):
+        return EmbedRenderResult(
+            html=_fallback_html("steam"), status="fetch_fallback", provider="steam"
         )
 
     image_data_uri = ""
@@ -470,15 +608,14 @@ async def render_embed(
             )
             image_ok = True
 
-    # Missing price or description can be a normal Steam product state;
-    # missing title or header image leaves the static widget incomplete.
-    loaded = bool(fields.get("name")) and image_ok
-    markup = _steam_card_html(fields, image_data_uri, partial=not loaded)
+    # Missing price, description, or artwork can be a normal Steam product
+    # state; metadata and the static card have still been parsed successfully.
+    markup = _steam_card_html(fields, image_data_uri, partial=not image_ok)
     return EmbedRenderResult(
         html=markup,
-        loaded=loaded,
-        fallback=not loaded,
+        status="success",
         provider="steam",
+        partial=not image_ok,
     )
 
 
@@ -487,3 +624,155 @@ __all__ = [
     "normalize_steam_widget_url",
     "render_embed",
 ]
+
+
+# Observed in t1050511-1-1; see the minimal live HTML fixture. These local
+# wrappers read mp4/poster (videojs) or mp4/m3u8/poster (tcplayer). A CSS class
+# alone, an onexin.com iframe, or another Keylol path is not a known player.
+_KEYLOL_VIDEO_PATHS = {
+    "/source/plugin/onexin_html5player/open/videojs/html5player.html": {"mp4", "poster"},
+    "/source/plugin/onexin_html5player/open/tcplayer/html5player.html": {"mp4", "m3u8", "poster"},
+}
+_KEYLOL_POSTER_HOSTS = frozenset({
+    "keylol.com", "www.keylol.com", "img.keylol.com", "blob.keylol.com",
+})
+_KEYLOL_POSTER_PATH_RE = re.compile(
+    r"^/data/attachment/(?:[a-z0-9_-]+/)*[a-z0-9_-]+\.(?:png|jpe?g|gif|webp|avif)$",
+    re.IGNORECASE,
+)
+_STEAM_VIDEO_PATH_RE = re.compile(
+    r"^/store_item_assets/steam/apps/([0-9]{1,15})/extras/[a-zA-Z0-9_-]+\.(?:mp4|webm)$"
+)
+_STEAM_TRAILER_PATH_RE = re.compile(
+    r"^/store_trailers/([0-9]{1,15})/(?:[a-zA-Z0-9_-]+/)+[a-zA-Z0-9_-]+\.m3u8$"
+)
+
+
+def _strict_https_parts(value: object) -> SplitResult | None:
+    """Parse only an unambiguous HTTPS URL; this never authorizes a request."""
+
+    if not isinstance(value, str) or not value or len(value) > 8192:
+        return None
+    if any(ord(char) <= 0x20 or ord(char) == 0x7F for char in value):
+        return None
+    try:
+        parts = urlsplit(value)
+        if (
+            parts.scheme.lower() != "https"
+            or not parts.hostname
+            or parts.netloc.lower() != parts.hostname.lower()
+            or parts.port is not None
+            or parts.fragment
+        ):
+            return None
+    except (ValueError, UnicodeError):
+        return None
+    return parts
+
+
+def _steam_video_app_id(value: str) -> str:
+    """Read a Steam source label/app ID without DNS or fetching video bytes."""
+
+    parts = _strict_https_parts(value)
+    if parts is None:
+        return ""
+    host = parts.hostname.lower()
+    if host in STEAM_CDN_HOSTS:
+        match = _STEAM_VIDEO_PATH_RE.fullmatch(parts.path)
+    elif host == "video.akamai.steamstatic.com":
+        match = _STEAM_TRAILER_PATH_RE.fullmatch(parts.path)
+    else:
+        return ""
+    if parts.query and not _CACHE_QUERY_RE.fullmatch(parts.query):
+        return ""
+    return match.group(1) if match else ""
+
+
+def _keylol_video_poster_allowed(url: str, app_id: str) -> bool:
+    """Only existing Steam app headers or static Keylol attachment images."""
+
+    if app_id and _steam_image_redirect_allowed(url, app_id):
+        return True
+    parts = _strict_https_parts(url)
+    return bool(
+        parts is not None
+        and parts.hostname.lower() in _KEYLOL_POSTER_HOSTS
+        and not parts.query
+        and _KEYLOL_POSTER_PATH_RE.fullmatch(parts.path)
+    )
+
+
+def _keylol_video_fields(url: object) -> dict[str, str] | None:
+    parts = _strict_https_parts(url)
+    if (
+        parts is None
+        or parts.hostname.lower() not in {"keylol.com", "www.keylol.com"}
+        or parts.path not in _KEYLOL_VIDEO_PATHS
+    ):
+        return None
+    # Malformed/unknown query fields never become proxy targets. The wrapper
+    # is still recognized as video, even when no safe metadata can be read.
+    fields = {"label": "", "poster_url": ""}
+    try:
+        pairs = parse_qsl(parts.query, keep_blank_values=True, max_num_fields=8, errors="strict")
+    except (ValueError, UnicodeError):
+        return fields
+    params = dict(pairs)
+    if len(params) != len(pairs) or not set(params) <= _KEYLOL_VIDEO_PATHS[parts.path]:
+        return fields
+    sources = [params[name] for name in ("mp4", "m3u8") if params.get(name)]
+    app_ids = {_steam_video_app_id(source) for source in sources}
+    app_id = next(iter(app_ids)) if len(app_ids) == 1 and "" not in app_ids else ""
+    if app_id:
+        fields["label"] = "Steam 视频"
+    poster = params.get("poster", "")
+    if poster and _keylol_video_poster_allowed(poster, app_id):
+        fields["poster_url"] = poster
+    return fields
+
+
+def classify_embed(url: object) -> Literal["steam_widget", "keylol_video", "unknown"]:
+    """Classify each provider independently without fetching iframe URLs."""
+
+    if normalize_steam_widget_url(url) is not None:
+        return "steam_widget"
+    if _keylol_video_fields(url) is not None:
+        return "keylol_video"
+    return "unknown"
+
+
+async def _keylol_video_card_html(
+    fields: Mapping[str, str], downloader: object, *, fetch: bool
+) -> str:
+    """Render a complete static video representation, including on preview failure."""
+
+    poster_url = fields.get("poster_url", "")
+    image = ""
+    if fetch and downloader is not None and poster_url:
+        # Pin the preview to exactly this approved image, including redirects.
+        # Neither the local wrapper nor any mp4/webm/m3u8/ts URL is fetched.
+        raw_image = await _call_fetch(
+            downloader, "fetch_image", poster_url,
+            allowed_url=lambda candidate: candidate == poster_url,
+            max_bytes=STEAM_WIDGET_MAX_IMAGE_BYTES,
+        )
+        result = _media_result_data(raw_image)
+        if (
+            result is not None
+            and len(result[0]) <= STEAM_WIDGET_MAX_IMAGE_BYTES
+            and _sniff_image(result[0], result[1]) is not None
+            and result[2] in {None, poster_url}
+        ):
+            data_uri = f"data:{result[1]};base64," + base64.b64encode(result[0]).decode("ascii")
+            image = (
+                f'<img data-keylol-embed-image="1" src="{data_uri}" '
+                'alt="视频预览图" loading="eager" decoding="async">'
+            )
+    label = html.escape(fields.get("label", ""), quote=True)
+    detail = f"<span> · {label}</span>" if label else ""
+    return (
+        '<figure class="media-card media-card-video keylol-browser-media-card keylol-video-embed" '
+        'data-keylol-embed-provider="keylol_video" data-keylol-embed-status="success">'
+        f'{image}<figcaption><strong>▶ 视频内容</strong>{detail}'
+        '<span>（静态截图无法播放）</span></figcaption></figure>'
+    )
