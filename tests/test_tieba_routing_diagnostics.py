@@ -1,4 +1,4 @@
-"""Capture-level routing, error attribution and fallback diagnostics contracts."""
+"""Capture-level browser routing and failure-diagnostics contracts."""
 import asyncio
 import json
 import unittest

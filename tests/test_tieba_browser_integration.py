@@ -211,7 +211,207 @@ class TiebaBrowserIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     "a successful native capture must not create failure artifacts",
                 )
 
-    async def test_login_page_saves_failure_artifacts_then_auto_falls_back(self):
+    async def _local_html_render_adapter(
+        self, browser, output_directory: Path, raw_dimensions: list[tuple[int, int, int]]
+    ):
+        """Render production HTML/options in a real local browser without network."""
+        paths = []
+
+        async def abort_request(route):
+            await route.abort()
+
+        async def render(document, _render_args, *, return_url, options):
+            self.assertFalse(return_url)
+            self.assertEqual(options["scale"], "device")
+            self.assertEqual(options["device_scale_factor_level"], "ultra")
+            width = int(options["viewport_width"])
+            height = int(options["viewport_height"])
+            dpr = {"normal": 1.0, "high": 1.3, "ultra": 1.8}[
+                options["device_scale_factor_level"]
+            ]
+            page = await browser.new_page(
+                viewport={"width": width, "height": height},
+                device_scale_factor=dpr,
+            )
+            try:
+                await page.route("**/*", abort_request)
+                await page.set_content(
+                    document, wait_until="load", timeout=options["timeout"]
+                )
+                self.assertEqual(await page.evaluate("window.innerWidth"), width)
+                self.assertAlmostEqual(await page.evaluate("window.devicePixelRatio"), dpr)
+                path = output_directory / f"tieba-html-{len(paths)}.png"
+                await page.screenshot(
+                    path=str(path),
+                    type=options["type"],
+                    full_page=options["full_page"],
+                    animations=options["animations"],
+                    caret=options["caret"],
+                    scale=options["scale"],
+                    timeout=options["timeout"],
+                )
+                with Image.open(path) as image:
+                    raw_dimensions.append((width, image.width, image.height))
+                paths.append(path)
+                return str(path)
+            finally:
+                await page.close()
+
+        return render, paths
+
+    @staticmethod
+    def _fixture_article(body_html: str):
+        article_type = importlib.import_module(
+            main.fetch_tieba_article.__module__
+        ).Article
+        return article_type(
+            title="Offline Tieba API and HTML renderer fixture",
+            author="fixture author",
+            published_at="2026-09-24 12:00",
+            source_url=_THREAD_URL,
+            body_html=body_html,
+            has_locked_resources=False,
+            is_authenticated=True,
+        )
+
+    async def test_html_ultra_scale_keeps_390_and_440_css_widths_through_production_path(self):
+        """Run fetch→real build_render_html→local DPR browser→safety encoder.
+
+        AstrBot's hosted T2I endpoint is kept offline. Its options are passed to
+        a local html_render adapter that applies the documented ultra=1.8
+        setting in Chromium, blocks every network request, and exercises the
+        actual plugin trimming and JPEG safety path.
+        """
+        channels = await self._available_local_channels()
+        module = self.browser_module
+        target_dimensions = {390: 702, 440: 792}
+
+        for channel in channels:
+            playwright = await module.async_playwright().start()
+            browser = await playwright.chromium.launch(headless=True, channel=channel)
+            try:
+                for css_width, physical_width in target_dimensions.items():
+                    with self.subTest(channel=channel, css_width=css_width), tempfile.TemporaryDirectory() as directory:
+                        output_directory = Path(directory)
+                        raw_dimensions = []
+                        plugin = main.KeylolScreenshotPlugin(
+                            object(),
+                            {
+                                "tieba_render_engine": "html",
+                                "content_width": css_width,
+                            },
+                        )
+                        article = self._fixture_article(
+                            '<p>本地 API 主楼正文 fixture。</p>'
+                            '<div style="height:180px;background:#dcecff">'
+                            "产生可见正文底部以验证自适应裁剪。"
+                            "</div>"
+                        )
+                        fetch = AsyncMock(return_value=article)
+                        local_render, paths = await self._local_html_render_adapter(
+                            browser, output_directory, raw_dimensions
+                        )
+                        plugin.html_render = local_render
+                        with patch.object(main, "fetch_tieba_article", fetch), patch.object(
+                            main,
+                            "capture_tieba_webpage_screenshot",
+                            new=AsyncMock(side_effect=AssertionError("HTML mode used Playwright")),
+                        ), patch.object(
+                            main.Comp.Image,
+                            "fromBytes",
+                            side_effect=_image_component,
+                            create=True,
+                        ):
+                            image_path = await plugin._render_tieba_screenshot(
+                                _THREAD_URL, _COOKIE
+                            )
+                            with Image.open(image_path) as trimmed:
+                                trimmed_size = trimmed.size
+                            chain = await plugin._prepare_image_chain([image_path])
+
+                        fetch.assert_awaited_once_with(
+                            _THREAD_URL,
+                            cookie=_COOKIE,
+                            request_timeout_seconds=25,
+                            inline_images=True,
+                        )
+                        self.assertEqual(raw_dimensions[0][0:2], (css_width, physical_width))
+                        self.assertLess(
+                            trimmed_size[1], raw_dimensions[0][2],
+                            "default adaptive_height should trim viewport-only whitespace",
+                        )
+                        self.assertEqual(trimmed_size[0], physical_width)
+                        self.assertEqual(len(chain), 1)
+                        with Image.open(BytesIO(chain[0].payload)) as image:
+                            self.assertEqual(image.format, "JPEG")
+                            self.assertEqual(image.width, physical_width)
+                            self.assertLessEqual(len(chain[0].payload), 10 * 1024 * 1024)
+                        self.assertEqual(len(paths), 1)
+            finally:
+                await browser.close()
+                await playwright.stop()
+
+    async def test_overlimit_html_output_is_scaled_only_by_send_safety(self):
+        channels = await self._available_local_channels()
+        channel = channels[0]
+        module = self.browser_module
+
+        with tempfile.TemporaryDirectory() as directory:
+            output_directory = Path(directory)
+            raw_dimensions = []
+            plugin = main.KeylolScreenshotPlugin(
+                object(),
+                {"tieba_render_engine": "html", "content_width": 390},
+            )
+            article = self._fixture_article(
+                '<div style="height:10000px;background:#eeeeee">'
+                "真实本地 renderer 超长 HTML 安全缩放 fixture。"
+                "</div>"
+            )
+            fetch = AsyncMock(return_value=article)
+            playwright = await module.async_playwright().start()
+            browser = await playwright.chromium.launch(headless=True, channel=channel)
+            try:
+                local_render, paths = await self._local_html_render_adapter(
+                    browser, output_directory, raw_dimensions
+                )
+                plugin.html_render = local_render
+                with patch.object(main, "fetch_tieba_article", fetch), patch.object(
+                    main.Comp.Image,
+                    "fromBytes",
+                    side_effect=_image_component,
+                    create=True,
+                ):
+                    image_path = await plugin._render_tieba_screenshot(
+                        _THREAD_URL, _COOKIE
+                    )
+                    with Image.open(image_path) as rendered:
+                        self.assertEqual(rendered.width, 702)
+                        self.assertGreater(rendered.height, 16_384)
+                    chain = await plugin._prepare_image_chain([image_path])
+            finally:
+                await browser.close()
+                await playwright.stop()
+
+            self.assertTrue(paths)
+            self.assertEqual(raw_dimensions[0][0:2], (390, 702))
+            self.assertGreater(raw_dimensions[0][2], 16_384)
+            self.assertEqual(len(chain), 1)
+            encoded = chain[0].payload
+            self.assertLessEqual(len(encoded), 10 * 1024 * 1024)
+            with Image.open(BytesIO(encoded)) as image:
+                self.assertEqual(image.format, "JPEG")
+                self.assertLess(image.width, 702)
+                self.assertGreater(image.width, 390)
+                self.assertLessEqual(max(image.size), 16_384)
+                self.assertLessEqual(image.width * image.height, 20_000_000)
+                self.assertTrue(
+                    all(value == 1 for table in image.quantization.values() for value in table),
+                    "the safety resize should retain quality 100 when that fits",
+                )
+            self.assertEqual(len(paths), 1)
+
+    async def test_login_page_saves_failure_artifacts_and_explicit_playwright_reports_error(self):
         channels = await self._available_local_channels()
         channel = channels[0]
         module = self.browser_module
@@ -221,13 +421,13 @@ class TiebaBrowserIntegrationTests(unittest.IsolatedAsyncioTestCase):
             plugin = main.KeylolScreenshotPlugin(
                 object(),
                 {
-                    "tieba_render_engine": "auto",
+                    "tieba_render_engine": "playwright",
                     "content_width": 440,
                     "browser_capture_timeout_ms": 15000,
                 },
             )
-            fallback = AsyncMock(return_value="fallback.png")
-            plugin._render_tieba_html_screenshot = fallback
+            html_renderer = AsyncMock(return_value="html.png")
+            plugin._render_tieba_html_screenshot = html_renderer
             errors = []
             original_capture = main.capture_tieba_webpage_screenshot
 
@@ -243,10 +443,11 @@ class TiebaBrowserIntegrationTests(unittest.IsolatedAsyncioTestCase):
             with patch.object(module, "DEBUG_DIRECTORY", debug_directory), route_patch, patch.object(
                 main, "capture_tieba_webpage_screenshot", new=capture_local
             ), patch.object(main.logger, "warning") as warning:
-                image_path = await plugin._render_tieba_screenshot(_THREAD_URL, _COOKIE)
+                with self.assertRaises(main.TiebaPageError) as caught:
+                    await plugin._render_tieba_screenshot(_THREAD_URL, _COOKIE)
 
-            self.assertEqual(image_path, "fallback.png")
-            fallback.assert_awaited_once_with(_THREAD_URL, _COOKIE)
+            self.assertEqual(str(caught.exception), "贴吧页面无法显示主楼。")
+            html_renderer.assert_not_awaited()
             self.assertTrue(requests)
             self.assertEqual(len(errors), 1)
             error = errors[0]
@@ -264,6 +465,7 @@ class TiebaBrowserIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("integration-stoken-secret", saved_html)
             warning_text = "\n".join(str(call.args[0]) for call in warning.call_args_list)
             self.assertIn("tieba_login_required", warning_text)
+            self.assertIn("engine=playwright，不回退", warning_text)
             self.assertNotIn("integration-bduss-secret", warning_text)
             self.assertNotIn("integration-stoken-secret", warning_text)
 

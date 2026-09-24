@@ -80,9 +80,7 @@ class KeylolScreenshotPlugin(Star):
             "full_page": True,
             "animations": "disabled",
             "caret": "hide",
-            # AstrBot's remote HTML renderer exposes DPR levels up to 1.8,
-            # not native DPR2. Keep its real CSS-pixel fallback capability;
-            # final JPEG normalization still applies every sending safety lock.
+            # Preserve Keylol's existing CSS-pixel HTML output.
             "scale": "css",
             "viewport_width": viewport_width,
             "viewport_height": viewport_height,
@@ -93,6 +91,16 @@ class KeylolScreenshotPlugin(Star):
                     int(self.config.get("render_timeout_ms", 30000)),
                 ),
             ),
+        }
+
+    def _tieba_html_screenshot_options(
+        self, viewport_width: int, viewport_height: int
+    ) -> dict[str, object]:
+        # Ask AstrBot's renderer for native DPR 1.8 pixels; never upscale PNGs.
+        return {
+            **self._mobile_screenshot_options(viewport_width, viewport_height),
+            "scale": "device",
+            "device_scale_factor_level": "ultra",
         }
 
     def _keylol_render_engine(self) -> str:
@@ -331,7 +339,7 @@ class KeylolScreenshotPlugin(Star):
             chain = []
             for path in image_paths:
                 source_renderer = (
-                    "playwright" if path in self._owned_capture_paths else "html_fallback"
+                    "playwright" if path in self._owned_capture_paths else "html"
                 )
                 with Image.open(path) as source_image:
                     source_width, source_height = source_image.size
@@ -398,8 +406,10 @@ class KeylolScreenshotPlugin(Star):
         return paths[0]
 
     def _tieba_render_engine(self) -> str:
-        value = str(self.config.get("tieba_render_engine", "auto")).strip().lower()
-        return value if value in {"auto", "playwright", "html"} else "auto"
+        value = str(self.config.get("tieba_render_engine", "html")).strip().lower()
+        # Legacy auto configurations now use the API directly, without first
+        # visiting the real thread page and triggering Baidu verification.
+        return "playwright" if value == "playwright" else "html"
 
     async def _render_tieba_html_screenshot(
         self, target_url: str, cookie: str
@@ -418,16 +428,19 @@ class KeylolScreenshotPlugin(Star):
             document,
             {},
             return_url=False,
-            options=self._mobile_screenshot_options(
+            options=self._tieba_html_screenshot_options(
                 viewport_width, viewport_height
             ),
         )
         if bool(self.config.get("adaptive_height", True)):
             try:
+                raw_width, _ = self._png_dimensions(image_path)
+                # Cropping accepts physical pixels and never changes width.
+                renderer_dpr = raw_width / viewport_width if raw_width else 1.8
                 await asyncio.to_thread(
                     trim_rendered_screenshot,
                     image_path,
-                    bottom_padding=MOBILE_PAGE_PADDING,
+                    bottom_padding=round(MOBILE_PAGE_PADDING * renderer_dpr),
                 )
             except Exception:
                 logger.warning(
@@ -554,28 +567,28 @@ class KeylolScreenshotPlugin(Star):
             f"engine={engine}, cookie_present={bool(str(cookie or '').strip())}。"
         )
         async with self._render_slots:
-            if engine != "html":
+            if engine == "playwright":
                 try:
                     return await self._render_tieba_browser_screenshot(
                         target_url, cookie
                     )
                 except TiebaBrowserCaptureError as exc:
                     details = self._tieba_browser_failure_details(exc, cookie)
-                    if engine == "playwright":
-                        logger.warning(
-                            "贴吧 Playwright 截图失败："
-                            f"{details}, fallback_reason={self._diagnostic_token(getattr(exc, 'reason', ''), 'capture_failed')}；"
-                            "engine=playwright，不回退。"
-                        )
-                        raise TiebaPageError(str(exc)) from exc
                     logger.warning(
                         "贴吧 Playwright 截图失败："
-                        f"{details}, fallback_reason={self._diagnostic_token(getattr(exc, 'reason', ''), 'capture_failed')}；"
-                        "engine=auto，将回退兼容模式。"
+                        f"{details}；engine=playwright，不回退。"
                     )
+                    raise TiebaPageError(str(exc)) from exc
             rendered = await self._render_tieba_html_screenshot(target_url, cookie)
+            viewport_width, _ = self._mobile_render_size()
+            raw_width, raw_height = self._png_dimensions(rendered)
+            renderer_dpr = f"{raw_width / viewport_width:.3f}" if raw_width else "unknown"
             logger.info(
-                "贴吧兼容截图完成：source_renderer=html_fallback, native_dpr2=False。"
+                "贴吧截图完成：engine=html, source_renderer=tieba_api_html, "
+                f"cookie_present={bool(str(cookie or '').strip())}, "
+                f"render_scale=1.8, renderer_dpr={renderer_dpr}, "
+                f"viewport_css_width={viewport_width}, "
+                f"raw_png_width={raw_width}, raw_png_height={raw_height}。"
             )
             return rendered
 

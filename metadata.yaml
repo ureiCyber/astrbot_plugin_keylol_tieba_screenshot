@@ -4,9 +4,10 @@ short_desc: 自动识别群消息中的其乐或百度贴吧链接并返回主�
 desc: |
   配置对应登录 Cookie 后，自动识别群消息中的其乐 Keylol 帖子链接、百度贴吧链接
   与 QQ 分享卡片，获取标题、作者、发布时间及完整主楼内容。其乐优先使用受控浏览器网页截图，
-  贴吧也优先使用受控浏览器真实网页截图，验证码、反爬或 DOM 不兼容等情况回退安全清洗后的 HTML；
-  网页截图采用原生 DPR2 无损分段拼接，统一安全编码后发送 JPEG；目录分图仅适用于其乐。
-version: 0.5.5
+  贴吧默认通过客户端 API 读取主楼并生成安全 HTML 截图；历史 auto 配置直接使用此路径，只有显式
+  playwright 才启用可能触发百度安全验证的实验性网页截图，且失败直接报错。贴吧 HTML 使用官方
+  renderer 的 ultra DPR 1.8；网页截图采用原生 DPR2 无损分段，统一安全编码后发送 JPEG；目录分图仅适用于其乐。
+version: 0.5.6
 author: キツネの嫁入り
 repo: https://github.com/ureiCyber/astrbot_plugin_keylol_tieba_screenshot
 astrbot_version: ">=4.0.0"

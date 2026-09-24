@@ -158,7 +158,7 @@ class ImageChainSafetyTests(unittest.IsolatedAsyncioTestCase):
 
             text = "\n".join(str(call.args[0]) for call in info.call_args_list)
             self.assertIn("source_renderer=playwright", text)
-            self.assertIn("source_renderer=html_fallback", text)
+            self.assertIn("source_renderer=html", text)
             self.assertIn("source_width=880, source_height=100", text)
             self.assertIn("source_width=440, source_height=100", text)
             self.assertIn("final_width=880, final_height=100", text)

@@ -18,7 +18,7 @@
   "tieba_cookie": {
     "type": "text",
     "description": "百度贴吧登录 Cookie（必须包含 BDUSS）",
-    "hint": "Cookie 会以明文保存在 AstrBot 配置目录。推荐使用专用小号；不要发到群聊、聊天记录或日志。API 模式只提取 BDUSS 并提交给百度贴吧官方域名 c.tieba.baidu.com；浏览器模式只向 tieba.baidu.com 和 www.tieba.baidu.com 注入 BDUSS 及可选 STOKEN，绝不向图床或第三方域名发送。",
+    "hint": "Cookie 会以明文保存在 AstrBot 配置目录。推荐使用专用小号；不要发到群聊、聊天记录或日志。HTML/API 模式将 BDUSS 作为表单参数提交给 c.tieba.baidu.com；图片内嵌请求仅在 tieba.baidu.com 和 www.tieba.baidu.com 携带 BDUSS 及可选 STOKEN，离开这两个域名的重定向会移除凭据。实验性浏览器模式也仅向这两个域名注入凭据；图床或第三方域名不携带登录 Cookie。",
     "default": ""
   },
   "auto_detect_enabled": {
@@ -53,19 +53,19 @@
   "tieba_render_engine": {
     "type": "string",
     "description": "百度贴吧截图引擎",
-    "hint": "auto 优先使用受控浏览器真实网页截图，环境不可用、验证码/反爬触发或页面 DOM 不兼容时自动回退安全 HTML；playwright 强制网页截图并显示错误；html 始终使用安全清洗兼容模式。",
-    "options": ["auto", "playwright", "html"],
-    "default": "auto"
+    "hint": "html：推荐。通过贴吧接口读取主楼并生成安全 HTML 高清截图，需要含 BDUSS 的 tieba_cookie；playwright：实验性真实网页截图，可能触发百度安全验证，失败时直接报错；auto：旧版兼容，不推荐，等同 html，不访问贴吧网页。",
+    "options": ["html", "playwright", "auto"],
+    "default": "html"
   },
   "content_width": {
     "type": "int",
-    "description": "其乐和百度贴吧网页截图宽度（CSS 像素，支持 320-440）",
+    "description": "其乐和百度贴吧截图布局宽度（CSS 像素，支持 320-440）",
     "default": 390
   },
   "adaptive_height": {
     "type": "bool",
     "description": "根据实际内容自动裁掉截图底部空白",
-    "hint": "仅影响 html 兼容模式：移除短帖下方由默认视口产生的纯白区域；长帖保留完整内容。",
+    "hint": "仅影响 HTML 渲染模式：移除短帖下方由默认视口产生的纯白区域；保留图片物理宽度，长帖保留完整内容。",
     "default": true
   },
   "inline_keylol_images": {
@@ -76,8 +76,8 @@
   },
   "inline_tieba_images": {
     "type": "bool",
-    "description": "兼容模式中下载并内嵌百度贴吧主楼图片",
-    "hint": "只影响 html 兼容模式和网页截图失败后的回退；可避免图床防盗链，插件设有单图和总量限制。",
+    "description": "HTML/API 模式中下载并内嵌百度贴吧主楼图片",
+    "hint": "影响 html 和历史 auto 模式；优先原图及高清资源，可避免图床防盗链，保留来源白名单、重定向、单图和总量限制。",
     "default": true
   },
   "request_timeout_seconds": {

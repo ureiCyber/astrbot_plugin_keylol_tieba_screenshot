@@ -467,14 +467,10 @@ def _api_error(payload: Any) -> str:
     code = payload.get("error_code", payload.get("no", 0))
     if str(code) in {"0", "None"}:
         return ""
-    message = (
-        payload.get("error_msg")
-        or payload.get("error")
-        or payload.get("errmsg")
-        or payload.get("msg")
-        or "未知错误"
-    )
-    return f"贴吧接口返回错误 {code}：{message}"
+    # Remote messages may echo request fields. Only expose a bounded numeric
+    # status, never an arbitrary response or the authentication form.
+    safe_code = str(code) if re.fullmatch(r"-?[0-9]{1,10}", str(code)) else "未知"
+    return f"贴吧接口返回错误 {safe_code}，请检查 Cookie 或帖子访问权限。"
 
 
 def _api_user_map(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -853,7 +849,10 @@ async def _post_tieba_json(
     url: str,
     fields: dict[str, Any],
 ) -> Any:
-    async with session.post(url, data=_signed_form(fields)) as response:
+    # A 307/308 redirect must never replay the BDUSS-bearing form elsewhere.
+    async with session.post(
+        url, data=_signed_form(fields), allow_redirects=False
+    ) as response:
         if response.status in {401, 403}:
             raise TiebaPageError("百度贴吧拒绝访问，请稍后更换网络重试。")
         if response.status != 200:
@@ -934,8 +933,8 @@ async def fetch_tieba_article(
         raise
     except asyncio.TimeoutError as exc:
         raise TiebaPageError("请求百度贴吧接口超时，请稍后重试。") from exc
-    except aiohttp.ClientError as exc:
-        raise TiebaPageError(f"百度贴吧接口请求失败：{exc}") from exc
+    except aiohttp.ClientError:
+        raise TiebaPageError("百度贴吧接口请求失败，请稍后重试。") from None
 
     if inline_images:
         article = await _inline_tieba_images(
@@ -975,5 +974,5 @@ async def check_tieba_cookie(
         raise
     except asyncio.TimeoutError as exc:
         raise TiebaPageError("验证贴吧 Cookie 超时，请稍后重试。") from exc
-    except aiohttp.ClientError as exc:
-        raise TiebaPageError(f"贴吧 Cookie 验证失败：{exc}") from exc
+    except aiohttp.ClientError:
+        raise TiebaPageError("贴吧 Cookie 验证请求失败，请稍后重试。") from None

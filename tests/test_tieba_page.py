@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import aiohttp
 from bs4 import BeautifulSoup
 
 from tieba_page import (
@@ -17,6 +18,7 @@ from tieba_page import (
     account_name_from_userinfo,
     article_from_api,
     extract_tieba_thread_urls,
+    fetch_tieba_article,
     normalize_tieba_url,
     parse_tieba_article,
     parse_tieba_cookie,
@@ -42,6 +44,7 @@ class _FakeResponse:
         self.status = status
         self.headers = headers or {}
         self.content = _FakeContent(payload)
+        self.charset = "utf-8"
 
     async def __aenter__(self):
         return self
@@ -51,9 +54,16 @@ class _FakeResponse:
 
 
 class _FakeSession:
-    def __init__(self, responses: list[_FakeResponse]):
+    def __init__(
+        self,
+        responses: list[_FakeResponse],
+        *,
+        post_error: aiohttp.ClientError | None = None,
+    ):
         self.responses = list(responses)
         self.requests: list[tuple[str, dict[str, object]]] = []
+        self.posts: list[tuple[str, dict[str, object]]] = []
+        self.post_error = post_error
 
     async def __aenter__(self):
         return self
@@ -63,6 +73,12 @@ class _FakeSession:
 
     def get(self, url: str, **kwargs: object):
         self.requests.append((url, kwargs))
+        return self.responses.pop(0)
+
+    def post(self, url: str, **kwargs: object):
+        self.posts.append((url, kwargs))
+        if self.post_error is not None:
+            raise self.post_error
         return self.responses.pop(0)
 
 
@@ -252,6 +268,142 @@ class TiebaPageTests(unittest.TestCase):
         self.assertIn("https://tieba.baidu.com/p/123", article.body_html)
         self.assertIn("视频内容，请打开原帖查看", article.body_html)
         self.assertNotIn("二楼不得出现", article.body_html)
+
+    def test_api_image_source_falls_back_in_high_resolution_priority_order(self):
+        cases = (
+            (
+                {
+                    "origin_src": "https://imgsa.baidu.com/origin.jpg",
+                    "big_cdn_src": "https://imgsa.baidu.com/big.jpg",
+                    "cdn_src": "https://imgsa.baidu.com/cdn.jpg",
+                    "src": "https://imgsa.baidu.com/src.jpg",
+                },
+                "https://imgsa.baidu.com/origin.jpg",
+            ),
+            (
+                {
+                    "big_cdn_src": "https://imgsa.baidu.com/big.jpg",
+                    "cdn_src": "https://imgsa.baidu.com/cdn.jpg",
+                    "src": "https://imgsa.baidu.com/src.jpg",
+                },
+                "https://imgsa.baidu.com/big.jpg",
+            ),
+            (
+                {
+                    "cdn_src": "https://imgsa.baidu.com/cdn.jpg",
+                    "src": "https://imgsa.baidu.com/src.jpg",
+                },
+                "https://imgsa.baidu.com/cdn.jpg",
+            ),
+            (
+                {"src": "https://imgsa.baidu.com/src.jpg"},
+                "https://imgsa.baidu.com/src.jpg",
+            ),
+        )
+        for sources, expected in cases:
+            with self.subTest(expected=expected):
+                article = article_from_api(
+                    {
+                        "error_code": 0,
+                        "thread": {"title": "原图优先级"},
+                        "post_list": [
+                            {"floor": 1, "content": [{"type": 3, **sources}]}
+                        ],
+                    },
+                    "https://tieba.baidu.com/p/123",
+                )
+                image = BeautifulSoup(article.body_html, "html.parser").find("img")
+                self.assertIsNotNone(image)
+                self.assertEqual(image["src"], expected)
+
+    def test_fetch_posts_bduss_only_to_client_api_without_following_redirects(self):
+        bduss = "bduss-test-secret"
+        stoken = "stoken-test-secret"
+        session = _FakeSession(
+            [_FakeResponse(200, json.dumps(API_SAMPLE).encode("utf-8"))]
+        )
+        with patch(
+            "tieba_page.aiohttp.ClientSession", return_value=session
+        ) as session_factory:
+            article = asyncio.run(
+                fetch_tieba_article(
+                    "https://tieba.baidu.com/p/123",
+                    cookie=f"BAIDUID=ignored; BDUSS={bduss}; STOKEN={stoken}",
+                    inline_images=False,
+                )
+            )
+
+        self.assertEqual(article.title, "接口测试帖")
+        self.assertEqual(len(session.posts), 1)
+        url, request = session.posts[0]
+        self.assertEqual(url, "https://c.tieba.baidu.com/c/f/pb/page")
+        form = request["data"]
+        self.assertEqual(form["BDUSS"], bduss)
+        self.assertNotIn("STOKEN", form)
+        self.assertNotIn(stoken, repr(request))
+        self.assertIs(request["allow_redirects"], False)
+        headers = session_factory.call_args.kwargs["headers"]
+        self.assertNotIn("Cookie", headers)
+        self.assertNotIn(bduss, repr(headers))
+        self.assertNotIn(stoken, repr(headers))
+
+    def test_api_requires_bduss_before_opening_a_network_session(self):
+        for cookie in ("", "STOKEN=optional-token", "BDUSS=; STOKEN=optional-token"):
+            with self.subTest(cookie=cookie), patch(
+                "tieba_page.aiohttp.ClientSession"
+            ) as session_factory:
+                with self.assertRaisesRegex(TiebaPageError, "未找到 BDUSS"):
+                    asyncio.run(
+                        fetch_tieba_article("https://tieba.baidu.com/p/123", cookie=cookie)
+                    )
+                session_factory.assert_not_called()
+
+    def test_api_error_does_not_echo_cookie_credentials(self):
+        bduss = "bduss-error-secret"
+        stoken = "stoken-error-secret"
+        payload = {
+            "error_code": f"403-{bduss}",
+            "error_msg": f"request failed: BDUSS={bduss}; STOKEN={stoken}",
+        }
+        session = _FakeSession(
+            [_FakeResponse(200, json.dumps(payload).encode("utf-8"))]
+        )
+        with patch("tieba_page.aiohttp.ClientSession", return_value=session):
+            with self.assertRaises(TiebaPageError) as caught:
+                asyncio.run(
+                    fetch_tieba_article(
+                        "https://tieba.baidu.com/p/123",
+                        cookie=f"BDUSS={bduss}; STOKEN={stoken}",
+                        inline_images=False,
+                    )
+                )
+
+        self.assertNotIn(bduss, str(caught.exception))
+        self.assertNotIn(stoken, str(caught.exception))
+        self.assertNotIn("request failed", str(caught.exception))
+
+    def test_api_transport_error_does_not_echo_cookie_credentials(self):
+        bduss = "bduss-transport-secret"
+        stoken = "stoken-transport-secret"
+        session = _FakeSession(
+            [],
+            post_error=aiohttp.ClientError(
+                f"connection failed with BDUSS={bduss}; STOKEN={stoken}"
+            ),
+        )
+        with patch("tieba_page.aiohttp.ClientSession", return_value=session):
+            with self.assertRaises(TiebaPageError) as caught:
+                asyncio.run(
+                    fetch_tieba_article(
+                        "https://tieba.baidu.com/p/123",
+                        cookie=f"BDUSS={bduss}; STOKEN={stoken}",
+                        inline_images=False,
+                    )
+                )
+
+        self.assertNotIn(bduss, str(caught.exception))
+        self.assertNotIn(stoken, str(caught.exception))
+        self.assertIsNone(caught.exception.__cause__)
 
     def test_rejects_client_api_error(self):
         with self.assertRaises(TiebaPageError):
@@ -687,6 +839,70 @@ class TiebaPageTests(unittest.TestCase):
             type(session_factory.call_args.kwargs["cookie_jar"]).__name__,
             "DummyCookieJar",
         )
+
+    def test_single_and_total_image_byte_limits_keep_safe_fallbacks(self):
+        per_image_session = _FakeSession(
+            [
+                _FakeResponse(
+                    200,
+                    b"12345",
+                    headers={"Content-Type": "image/png"},
+                )
+            ]
+        )
+        with patch(
+            "tieba_page.aiohttp.ClientSession", return_value=per_image_session
+        ):
+            per_image_result = asyncio.run(
+                _inline_tieba_images(
+                    _image_article("https://imgsa.baidu.com/large.png"),
+                    cookie="",
+                    timeout_seconds=5,
+                    max_image_bytes=4,
+                )
+            )
+        self.assertIn("[图片未加载]", per_image_result.body_html)
+        self.assertNotIn("data:image/", per_image_result.body_html)
+
+        total_image_article = Article(
+            "标题",
+            "作者",
+            "时间",
+            "https://tieba.baidu.com/p/123",
+            '<img src="https://imgsa.baidu.com/first.png">'
+            '<img src="https://imgsa.baidu.com/second.png">',
+            False,
+            True,
+        )
+        total_session = _FakeSession(
+            [
+                _FakeResponse(
+                    200,
+                    b"12345",
+                    headers={"Content-Type": "image/png"},
+                ),
+                _FakeResponse(
+                    200,
+                    b"67890",
+                    headers={"Content-Type": "image/png"},
+                ),
+            ]
+        )
+        with patch("tieba_page.aiohttp.ClientSession", return_value=total_session):
+            total_result = asyncio.run(
+                _inline_tieba_images(
+                    total_image_article,
+                    cookie="",
+                    timeout_seconds=5,
+                    max_image_bytes=8,
+                    max_total_bytes=8,
+                )
+            )
+        body = BeautifulSoup(total_result.body_html, "html.parser")
+        images = body.find_all("img")
+        self.assertEqual(len(images), 1)
+        self.assertTrue(images[0]["src"].startswith("data:image/png;base64,"))
+        self.assertIn("[图片未加载]", body.get_text())
 
     def test_avif_image_is_embedded_when_advertised_as_supported(self):
         session = _FakeSession(
