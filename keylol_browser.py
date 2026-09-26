@@ -844,7 +844,7 @@ async def capture_keylol_webpage_screenshot(
     completed = False
 
     playwright = browser = context = page = None
-    media_downloader = SafeMediaDownloader()
+    media_downloader = SafeMediaDownloader(steam_proxy_url=proxy_url)
     try:
         playwright = await async_playwright().start()
         launch_kwargs: dict[str, object] = {"headless": True}

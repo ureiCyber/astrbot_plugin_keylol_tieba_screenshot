@@ -39,7 +39,7 @@
   },
   "proxy_url": {
     "type": "string",
-    "description": "可选：网页截图访问其乐和百度贴吧时使用的 HTTP/HTTPS 代理",
+    "description": "可选：其乐、百度贴吧网页截图及 Steam Widget 商品卡使用的 HTTP/HTTPS 代理",
     "hint": "示例：http://127.0.0.1:7890",
     "default": ""
   },

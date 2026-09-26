@@ -1258,6 +1258,7 @@ async def fetch_article(
                 downloader = SafeMediaDownloader(
                     max_image_bytes=max_image_bytes,
                     max_total_bytes=max_total_image_bytes,
+                    steam_proxy_url=proxy_url,
                 )
                 try:
                     article = await _inline_external_images(

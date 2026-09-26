@@ -6,7 +6,12 @@ from bs4 import BeautifulSoup
 from unittest.mock import patch
 
 from safe_media import SafeHtml, SafeImage
-from keylol_embeds import classify_embed, normalize_steam_widget_url, render_embed
+from keylol_embeds import (
+    _steam_image_redirect_allowed,
+    classify_embed,
+    normalize_steam_widget_url,
+    render_embed,
+)
 
 
 WIDGET = b"""<!doctype html><html><head><meta property='og:title' content='Test Game'></head>
@@ -15,24 +20,47 @@ WIDGET = b"""<!doctype html><html><head><meta property='og:title' content='Test 
 <div class='game_header_image_ctn'><img src='https://shared.cloudflare.steamstatic.com/store_item_assets/steam/apps/123/header.jpg?t=1'></div>
 </body></html>"""
 PNG = b"\x89PNG\r\n\x1a\n" + b"fixture"
+UNSET = object()
 
 
 class FakeDownloader:
     html_payload = WIDGET
     html_content_type = "text/html"
+    html_response = UNSET
+    image_response = UNSET
+    html_diagnostics = {}
+    image_diagnostics = {}
 
-    async def fetch_html(self, url, *, allowed_url, max_bytes, **_kwargs):
+    async def fetch_html(self, url, *, allowed_url, max_bytes, **kwargs):
         self.html_url = url
         self.html_policy = allowed_url
+        self.html_request_diagnostics = kwargs.get("diagnostics")
+        if self.html_request_diagnostics is not None:
+            self.html_request_diagnostics.update(self.html_diagnostics)
+            self.html_request_diagnostics.setdefault("final_url", url)
+        if self.html_response is not UNSET:
+            return self.html_response
         return SafeHtml(self.html_payload, self.html_content_type)
 
-    async def fetch_image(self, url, *, allowed_url, max_bytes, **_kwargs):
+    async def fetch_image(self, url, *, allowed_url, max_bytes, **kwargs):
         self.image_url = url
         self.image_policy = allowed_url
+        self.image_request_diagnostics = kwargs.get("diagnostics")
+        if self.image_request_diagnostics is not None:
+            self.image_request_diagnostics.update(self.image_diagnostics)
+            self.image_request_diagnostics.setdefault("final_url", url)
+        if self.image_response is not UNSET:
+            return self.image_response
         return SafeImage(PNG, "image/png")
 
 
 class KeylolEmbedTests(unittest.TestCase):
+    def steam_fixture(self, language):
+        fixture_path = (
+            Path(__file__).parent / "fixtures" / f"steam_widget_3575980_{language}.html"
+        )
+        return fixture_path.read_bytes()
+
     def test_only_exact_steam_widget_urls_are_supported(self):
         self.assertEqual(
             normalize_steam_widget_url("https://store.steampowered.com/widget/123/?utm_source=keylol"),
@@ -59,6 +87,219 @@ class KeylolEmbedTests(unittest.TestCase):
         self.assertTrue(downloader.html_policy(downloader.html_url))
         self.assertTrue(downloader.image_policy(downloader.image_url))
 
+    def test_current_widget_heading_wins_over_unrelated_document_og_title(self):
+        downloader = FakeDownloader()
+        downloader.html_payload = self.steam_fixture("en").replace(
+            b"<title>",
+            b'<meta property="og:title" content="Unrelated document title"><title>',
+            1,
+        )
+
+        result = asyncio.run(
+            render_embed("https://store.steampowered.com/widget/3575980/", downloader)
+        )
+
+        self.assertEqual(result.status, "success")
+        self.assertEqual(result.reason, "success")
+        self.assertIn(
+            "Fantasy Maiden Wars - DREAM OF THE STRAY DREAMER",
+            result.diagnostics["fields"]["name"],
+        )
+        self.assertNotEqual(result.diagnostics["fields"]["name"], "Unrelated document title")
+        self.assertNotIn("Unrelated document title", result.html)
+
+    def test_legacy_og_title_requires_same_app_artwork(self):
+        title_only = FakeDownloader()
+        title_only.html_payload = b"""<html><head>
+          <meta property="og:title" content="Unrelated generic title">
+        </head><body></body></html>"""
+        rejected = asyncio.run(
+            render_embed("https://store.steampowered.com/widget/123/", title_only)
+        )
+        self.assertEqual(rejected.status, "fetch_fallback")
+        self.assertEqual(rejected.reason, "parse_missing_title")
+        self.assertNotIn("Unrelated generic title", rejected.html)
+
+        # Keep the older widget shape working when it has a same-AppID header,
+        # description, and pricing block alongside its Open Graph title.
+        legacy = FakeDownloader()
+        accepted = asyncio.run(
+            render_embed("https://store.steampowered.com/widget/123/", legacy)
+        )
+        self.assertEqual(accepted.status, "success")
+        self.assertEqual(accepted.reason, "success")
+        self.assertEqual(accepted.diagnostics["fields"]["name"], "Test Game")
+        self.assertTrue(legacy.image_policy(legacy.image_url))
+        self.assertIn("A short description", accepted.html)
+        self.assertIn("$2.49", accepted.html)
+
+    def test_live_3575980_chinese_and_english_widgets_render_full_static_cards(self):
+        expected_description = (
+            "Command a legion of more than 70 beloved Touhou Project heroines on an "
+            "expansive quest to uncover the cause of mysterious incidents blossoming "
+            "throughout Gensokyo. Deploy units on grid-based maps to battle monsters "
+            "with flashy Spell Cards, and conquer each stage with strategic mastery."
+        )
+        for language, host, prefix in (
+            ("zh", "shared.st.dl.eccdnx.com", "购买"),
+            ("en", "shared.cdn.queniuqe.com", "Buy"),
+        ):
+            with self.subTest(language=language):
+                downloader = FakeDownloader()
+                downloader.html_payload = self.steam_fixture(language)
+                downloader.html_diagnostics = {
+                    "http_status": 200,
+                    "final_url": "https://store.steampowered.com/widget/3575980/",
+                    "content_type": "text/html",
+                    "redirect_count": 0,
+                    "body_length": len(downloader.html_payload),
+                }
+                downloader.image_diagnostics = {
+                    "http_status": 200,
+                    "content_type": "image/png",
+                    "redirect_count": 0,
+                    "body_length": len(PNG),
+                }
+                result = asyncio.run(
+                    render_embed("https://store.steampowered.com/widget/3575980/", downloader)
+                )
+
+                self.assertEqual(result.status, "success")
+                self.assertEqual(result.reason, "success")
+                self.assertTrue(result.loaded)
+                self.assertFalse(result.fallback)
+                self.assertNotIn("静态截图无法完整加载", result.html)
+                self.assertNotIn(f"{prefix} Fantasy Maiden Wars", result.html)
+                self.assertIn("Fantasy Maiden Wars - DREAM OF THE STRAY DREAMER", result.html)
+                self.assertIn(expected_description, result.html)
+                self.assertIn("-30%", result.html)
+                self.assertIn("¥ 128.00", result.html)
+                self.assertIn("¥ 89.60", result.html)
+                self.assertIn(">STEAM</span>", result.html)
+                self.assertIn("在 Steam 上购买", result.html)
+                self.assertIn("data:image/png;base64,", result.html)
+                self.assertNotIn("<script", result.html.lower())
+                self.assertTrue(downloader.image_policy(downloader.image_url))
+                self.assertIn(host, downloader.image_url)
+
+                diagnostics = result.diagnostics
+                self.assertEqual(diagnostics["reason"], "success")
+                self.assertEqual(diagnostics["html_length"], len(downloader.html_payload))
+                self.assertEqual(
+                    diagnostics["request"],
+                    {
+                        "http_status": 200,
+                        "final_url": downloader.html_url,
+                        "content_type": "text/html",
+                        "redirect_count": 0,
+                        "body_length": len(downloader.html_payload),
+                    },
+                )
+                self.assertEqual(
+                    diagnostics["image_request"]["content_type"], "image/png"
+                )
+                self.assertEqual(diagnostics["image_request"]["redirect_count"], 0)
+                self.assertEqual(
+                    diagnostics["image_request"]["final_url"], downloader.image_url
+                )
+                self.assertIn("Fantasy Maiden Wars", diagnostics["title"])
+                self.assertTrue(
+                    any(node.get("id") == "widget" for node in diagnostics["root_nodes"])
+                )
+                fields = diagnostics["fields"]
+                self.assertIn("Fantasy Maiden Wars - DREAM OF THE STRAY DREAMER", fields["name"])
+                self.assertEqual(fields["description"], expected_description)
+                self.assertEqual(fields["price"], "¥ 89.60")
+                self.assertEqual(fields["original_price"], "¥ 128.00")
+                self.assertEqual(fields["discount"], "-30%")
+                self.assertIn("capsule_184x69.jpg", fields["image_url"])
+                self.assertEqual(fields["app_id"], "3575980")
+
+    def test_steam_image_allowlist_accepts_only_named_same_app_artwork(self):
+        allowed = (
+            "https://shared.cdn.queniuqe.com/store_item_assets/steam/apps/3575980/"
+            "79f7ec4b9b4b3153dfd1d41a7fabef01d1ba4c5c/capsule_184x69.jpg?t=1761286177",
+            "https://shared.st.dl.eccdnx.com/steam/apps/3575980/capsule_231x87.jpg",
+            "https://shared.cloudflare.steamstatic.com/steam/apps/3575980/header.jpg",
+        )
+        denied = (
+            "http://shared.cdn.queniuqe.com/steam/apps/3575980/header.jpg",
+            "https://shared.cdn.queniuqe.com/steam/apps/4813850/header.jpg",
+            "https://shared.cdn.queniuqe.com/steam/apps/3575980/other.jpg",
+            "https://shared.cdn.queniuqe.com/steam/apps/3575980/capsule_460x215.jpg",
+            "https://shared.cdn.queniuqe.com/steam/apps/3575980/"
+            "79f7ec4b9b4b3153dfd1d41a7fabef01d1ba4c5/capsule_184x69.jpg",
+            "https://shared.cdn.queniuqe.com/steam/apps/3575980/"
+            "79f7ec4b9b4b3153dfd1d41a7fabef01d1ba4c5g/capsule_184x69.jpg",
+            "https://shared.cdn.queniuqe.com/steam/apps/3575980/"
+            "%37%39f7ec4b9b4b3153dfd1d41a7fabef01d1ba4c5c/capsule_184x69.jpg",
+            "https://shared.cdn.queniuqe.com/steam/apps/3575980/../3575980/header.jpg",
+            "https://shared.cdn.queniuqe.com.evil.example/steam/apps/3575980/header.jpg",
+            "https://user@shared.cdn.queniuqe.com/steam/apps/3575980/header.jpg",
+            "https://shared.cdn.queniuqe.com:443/steam/apps/3575980/header.jpg",
+            "https://shared.cdn.queniuqe.com/steam/apps/3575980/header.jpg?redirect=https://evil.example/",
+        )
+        for url in allowed:
+            with self.subTest(allowed=url):
+                self.assertTrue(_steam_image_redirect_allowed(url, "3575980"))
+        for url in denied:
+            with self.subTest(denied=url):
+                self.assertFalse(_steam_image_redirect_allowed(url, "3575980"))
+
+    def test_missing_secondary_fields_keeps_recognized_product_title(self):
+        downloader = FakeDownloader()
+        downloader.html_payload = b"""<html><body><div id="widget">
+          <div id="header" class="header_container"><h1 class="main_text">
+            <a href="https://store.steampowered.com/app/3575980/Game/">Buy A Recognized Game</a>
+          </h1></div>
+        </div></body></html>"""
+
+        result = asyncio.run(
+            render_embed("https://store.steampowered.com/widget/3575980/", downloader)
+        )
+
+        self.assertEqual(result.status, "success")
+        self.assertEqual(result.reason, "image_url_unrecognized")
+        self.assertIn("A Recognized Game", result.html)
+        self.assertIn(">STEAM</span>", result.html)
+        self.assertNotIn("Steam 商店内容（静态截图无法完整加载）", result.html)
+        self.assertFalse(hasattr(downloader, "image_url"))
+
+    def test_image_download_failure_preserves_product_text(self):
+        downloader = FakeDownloader()
+        downloader.html_payload = self.steam_fixture("en")
+        downloader.image_response = None
+
+        result = asyncio.run(
+            render_embed("https://store.steampowered.com/widget/3575980/", downloader)
+        )
+
+        self.assertEqual(result.status, "success")
+        self.assertEqual(result.reason, "image_fetch_failed")
+        self.assertIn("Fantasy Maiden Wars - DREAM OF THE STRAY DREAMER", result.html)
+        self.assertIn("¥ 89.60", result.html)
+        self.assertIn("Command a legion of more than 70", result.html)
+        self.assertNotIn("Steam 商店内容（静态截图无法完整加载）", result.html)
+        self.assertNotIn("data:image/png;base64,", result.html)
+
+    def test_unrecognized_image_url_keeps_product_text_without_fetching_it(self):
+        downloader = FakeDownloader()
+        downloader.html_payload = self.steam_fixture("en").replace(
+            b"https://shared.cdn.queniuqe.com/store_item_assets/",
+            b"https://untrusted.example/store_item_assets/",
+        )
+
+        result = asyncio.run(
+            render_embed("https://store.steampowered.com/widget/3575980/", downloader)
+        )
+
+        self.assertEqual(result.status, "success")
+        self.assertEqual(result.reason, "image_url_unrecognized")
+        self.assertIn("Fantasy Maiden Wars - DREAM OF THE STRAY DREAMER", result.html)
+        self.assertIn("¥ 89.60", result.html)
+        self.assertNotIn("Steam 商店内容（静态截图无法完整加载）", result.html)
+        self.assertFalse(hasattr(downloader, "image_url"))
+
     def test_steam_provider_error_is_rebuilt_from_confirmed_error_dom(self):
         fixture_path = Path(__file__).parent / "fixtures" / "steam_widget_provider_error.html"
         downloader = FakeDownloader()
@@ -69,6 +310,7 @@ class KeylolEmbedTests(unittest.TestCase):
         )
 
         self.assertEqual(result.status, "provider_error")
+        self.assertEqual(result.reason, "provider_error")
         self.assertTrue(result.loaded)
         self.assertFalse(result.fallback)
         self.assertIn("错误", result.html)
@@ -95,6 +337,7 @@ class KeylolEmbedTests(unittest.TestCase):
         )
 
         self.assertEqual(result.status, "provider_error")
+        self.assertEqual(result.reason, "provider_error")
         self.assertIn('data-keylol-embed-status="provider_error"', result.html)
         self.assertNotIn("<script", result.html.lower())
         self.assertNotIn("onerror", result.html.lower())
@@ -124,6 +367,7 @@ class KeylolEmbedTests(unittest.TestCase):
         )
 
         self.assertEqual(result.status, "fetch_fallback")
+        self.assertEqual(result.reason, "parse_missing_title")
         self.assertIn(
             "Steam 商店内容（静态截图无法完整加载）",
             BeautifulSoup(result.html, "html.parser").get_text("", strip=True),
@@ -135,6 +379,9 @@ class KeylolEmbedTests(unittest.TestCase):
                 self.html_url = url
                 self.html_policy = allowed_url
                 self.redirect_allowed = allowed_url("https://127.0.0.1/private")
+                diagnostics = _kwargs.get("diagnostics")
+                if diagnostics is not None and not self.redirect_allowed:
+                    diagnostics["reason"] = "redirect_rejected"
                 return None if not self.redirect_allowed else SafeHtml(WIDGET, "text/html")
 
         rejected = RedirectAttempt()
@@ -143,6 +390,7 @@ class KeylolEmbedTests(unittest.TestCase):
         )
         self.assertFalse(rejected.redirect_allowed)
         self.assertEqual(rejected_result.status, "fetch_fallback")
+        self.assertEqual(rejected_result.reason, "redirect_rejected")
 
         class UntrustedFinalUrl(FakeDownloader):
             async def fetch_html(self, url, *, allowed_url, max_bytes, **_kwargs):
@@ -159,6 +407,7 @@ class KeylolEmbedTests(unittest.TestCase):
         )
         self.assertFalse(redirected.html_policy("https://127.0.0.1/private"))
         self.assertEqual(redirected_result.status, "fetch_fallback")
+        self.assertEqual(redirected_result.reason, "redirect_rejected")
 
     def test_steam_timeout_is_fetch_fallback(self):
         class Slow(FakeDownloader):
@@ -179,6 +428,7 @@ class KeylolEmbedTests(unittest.TestCase):
 
         self.assertTrue(slow.called)
         self.assertEqual(result.status, "fetch_fallback")
+        self.assertEqual(result.reason, "request_failed")
         self.assertTrue(result.fallback)
 
     def test_unknown_and_failed_embeds_are_visible_fallbacks(self):
@@ -200,6 +450,7 @@ class KeylolEmbedTests(unittest.TestCase):
         failed = asyncio.run(render_embed("https://store.steampowered.com/widget/123/", failed_downloader))
         self.assertTrue(failed_downloader.called)
         self.assertEqual(failed.status, "fetch_fallback")
+        self.assertEqual(failed.reason, "request_failed")
         self.assertFalse(failed.loaded)
         self.assertTrue(failed.fallback)
         self.assertIn("Steam 商店内容", failed.html)
@@ -213,8 +464,49 @@ class KeylolEmbedTests(unittest.TestCase):
         )
 
         self.assertEqual(result.status, "fetch_fallback")
+        self.assertEqual(result.reason, "content_type_rejected")
         self.assertTrue(result.fallback)
         self.assertIn("Steam 商店内容", result.html)
+
+    def test_steam_diagnostics_distinguish_http_status_and_rejected_body(self):
+        bad_status = FakeDownloader()
+        bad_status.html_response = {
+            "data": WIDGET,
+            "content_type": "text/html",
+            "status": 503,
+            "final_url": "https://store.steampowered.com/widget/123/",
+        }
+        status_result = asyncio.run(
+            render_embed("https://store.steampowered.com/widget/123/", bad_status)
+        )
+        self.assertEqual(status_result.status, "fetch_fallback")
+        self.assertEqual(status_result.reason, "http_status")
+
+        bad_body = FakeDownloader()
+        bad_body.html_response = SafeHtml(b"", "text/html")
+        body_result = asyncio.run(
+            render_embed("https://store.steampowered.com/widget/123/", bad_body)
+        )
+        self.assertEqual(body_result.status, "fetch_fallback")
+        self.assertEqual(body_result.reason, "body_rejected")
+
+    def test_provider_error_heading_with_same_app_link_is_not_a_product_title(self):
+        downloader = FakeDownloader()
+        downloader.html_payload = b"""<html><body><div id="widget">
+          <div class="header_container"><h1 class="main_text">
+            <a href="https://store.steampowered.com/app/4813850/">Error</a>
+          </h1></div>
+          <div class="desc">Unable to read information for this item.</div>
+        </div></body></html>"""
+
+        result = asyncio.run(
+            render_embed("https://store.steampowered.com/widget/4813850/", downloader)
+        )
+
+        self.assertEqual(result.status, "provider_error")
+        self.assertEqual(result.reason, "provider_error")
+        self.assertNotIn('data-keylol-embed-status="success"', result.html)
+        self.assertNotIn("Steam 商店内容（静态截图无法完整加载）", result.html)
 
 
 class KeylolVideoEmbedTests(unittest.TestCase):
@@ -277,6 +569,34 @@ class KeylolVideoEmbedTests(unittest.TestCase):
                 self.assertTrue(downloader.policy(poster))
                 for redirect in (self.source, "https://127.0.0.1/p.png", "https://elsewhere.org/p.png", poster + "?redirect=1"):
                     self.assertFalse(downloader.policy(redirect))
+
+    def test_legacy_uppercase_header_remains_allowed_but_capsules_and_china_cdn_do_not(self):
+        uppercase_header = self.poster.replace("header.jpg", "Header.JPG")
+        result, downloader = self.render(
+            params={"mp4": self.source, "poster": uppercase_header},
+            downloader=self.Downloader(SafeImage(PNG, "image/png")),
+        )
+        self.assert_static_video(result)
+        self.assertIn("data:image/png;base64,", result.html)
+        self.assertEqual(downloader.requests, [("image", uppercase_header)])
+        self.assertTrue(downloader.policy(uppercase_header))
+
+        rejected_posters = (
+            "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/"
+            "4813850/capsule_184x69.jpg",
+            "https://shared.cdn.queniuqe.com/store_item_assets/steam/apps/4813850/"
+            "79f7ec4b9b4b3153dfd1d41a7fabef01d1ba4c5c/header.jpg",
+            "https://shared.st.dl.eccdnx.com/store_item_assets/steam/apps/4813850/"
+            "79f7ec4b9b4b3153dfd1d41a7fabef01d1ba4c5c/capsule_184x69.jpg",
+        )
+        for poster in rejected_posters:
+            with self.subTest(poster=poster):
+                result, downloader = self.render(
+                    params={"mp4": self.source, "poster": poster}
+                )
+                self.assert_static_video(result)
+                self.assertNotIn("<img", result.html)
+                self.assertEqual(downloader.requests, [])
 
     def test_preview_failure_or_invalid_image_keeps_a_video_card(self):
         for response in (

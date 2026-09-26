@@ -7,7 +7,7 @@ desc: |
   贴吧默认通过客户端 API 读取主楼并生成安全 HTML 截图；历史 auto 配置直接使用此路径，只有显式
   playwright 才启用可能触发百度安全验证的实验性网页截图，且失败直接报错。贴吧 HTML 使用官方
   renderer 的 ultra DPR 1.8；网页截图采用原生 DPR2 无损分段，统一安全编码后发送 JPEG；目录分图仅适用于其乐。
-version: 0.5.6
+version: 0.5.7
 author: キツネの嫁入り
 repo: https://github.com/ureiCyber/astrbot_plugin_keylol_tieba_screenshot
 astrbot_version: ">=4.0.0"

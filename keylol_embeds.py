@@ -11,8 +11,9 @@ import asyncio
 import base64
 import html
 import inspect
+import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Literal, Mapping
 from urllib.parse import SplitResult, parse_qsl, urlsplit
 
@@ -23,9 +24,10 @@ STEAM_STORE_HOST = "store.steampowered.com"
 STEAM_WIDGET_TIMEOUT_SECONDS = 10
 STEAM_WIDGET_MAX_HTML_BYTES = 512 * 1024
 STEAM_WIDGET_MAX_IMAGE_BYTES = 2 * 1024 * 1024
+logger = logging.getLogger(__name__)
 
 # These hosts serve Steam artwork. Paths are separately restricted to the
-# exact app header image, so the allowlist does not grant general CDN access.
+# exact app artwork path, so the allowlist does not grant general CDN access.
 STEAM_CDN_HOSTS = frozenset(
     {
         "cdn.akamai.steamstatic.com",
@@ -36,10 +38,15 @@ STEAM_CDN_HOSTS = frozenset(
         "steamcdn-a.akamaihd.net",
     }
 )
+# Observed in the live 3575980 widget response (Steam's China CDN variants).
+# Kept separate so existing video-source/poster permissions do not expand.
+STEAM_WIDGET_CDN_HOSTS = STEAM_CDN_HOSTS | frozenset({
+    "shared.cdn.queniuqe.com", "shared.st.dl.eccdnx.com",
+})
 _WIDGET_PATH_RE = re.compile(r"^/widget/([0-9]{1,15})/$")
 _STEAM_IMAGE_PATH_RE = re.compile(
-    r"^/(?:store_item_assets/)?steam/apps/([0-9]{1,15})/header\.jpg$",
-    re.IGNORECASE,
+    r"^/(?:store_item_assets/)?steam/apps/([0-9]{1,15})/"
+    r"(?:[0-9a-f]{40}/)?(?:header|capsule_184x69|capsule_231x87)\.jpg$",
 )
 _CACHE_QUERY_RE = re.compile(r"^t=[0-9]{1,20}$")
 _DISCOUNT_RE = re.compile(r"(?:-|−)\s*\d{1,3}\s*%")
@@ -47,6 +54,53 @@ _DISCOUNT_RE = re.compile(r"(?:-|−)\s*\d{1,3}\s*%")
 # Fixed local styling for the rebuilt embed cards. Callers should append
 # this to their render stylesheet; it contains no provider CSS or resources.
 EMBED_CARD_CSS = """
+.keylol-browser-media-card.keylol-browser-steam-embed {
+  display: block; box-sizing: border-box; overflow: hidden;
+  margin: 12px 0; padding: 16px; border: 1px solid #344654;
+  border-radius: 4px; background: linear-gradient(120deg, #22394b, #162331);
+  color: #c7d5e0; font: 14px/1.55 Arial, Helvetica, sans-serif;
+  text-align: left;
+}
+.keylol-browser-steam-embed .keylol-steam-embed-heading {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  gap: 14px; margin-bottom: 14px;
+}
+.keylol-browser-steam-embed .keylol-steam-embed-title {
+  color: #fff; font-size: 18px; line-height: 1.3; overflow-wrap: anywhere;
+}
+.keylol-browser-steam-embed .keylol-steam-embed-brand {
+  flex-shrink: 0; color: #fff; font-size: 12px; letter-spacing: 1px;
+  border: 1px solid #8299aa; border-radius: 3px; padding: 2px 6px;
+}
+.keylol-browser-steam-embed .keylol-steam-embed-image img {
+  display: block; width: 100%; max-width: 100%; height: auto;
+  margin: 0 0 14px; border: 0;
+}
+.keylol-browser-steam-embed .keylol-steam-embed-description {
+  margin: 0 0 16px; color: #c7d5e0; font-size: 14px; line-height: 1.55;
+}
+.keylol-browser-steam-embed .keylol-steam-embed-pricing {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 10px;
+  padding: 8px; background: #101c26;
+}
+.keylol-browser-steam-embed .keylol-steam-embed-discount {
+  background: #4c6b22; color: #beee11; font-size: 24px; padding: 0 7px;
+}
+.keylol-browser-steam-embed .keylol-steam-embed-prices { display: grid; }
+.keylol-browser-steam-embed .keylol-steam-embed-original-price {
+  color: #8f98a0; font-size: 12px; text-decoration: line-through;
+}
+.keylol-browser-steam-embed .keylol-steam-embed-price {
+  color: #beee11; font-size: 18px;
+}
+.keylol-browser-steam-embed a.keylol-steam-embed-buy {
+  display: inline-block; margin-left: auto; border-radius: 2px;
+  background: #4c7518; color: #fff !important; text-decoration: none;
+  padding: 8px 10px; font-size: 13px; white-space: nowrap;
+}
+.keylol-browser-steam-embed .keylol-steam-embed-partial {
+  display: block; margin-top: 10px; font-size: 12px; color: #8f98a0;
+}
 .keylol-steam-widget-error {
   box-sizing: border-box;
   display: flex;
@@ -92,6 +146,9 @@ class EmbedRenderResult:
     status: Literal["success", "provider_error", "fetch_fallback"]
     provider: str | None
     partial: bool = False
+    # Internal only: never interpolated into the user-facing card.
+    reason: str = "success"
+    diagnostics: dict[str, object] = field(default_factory=dict)
 
     @property
     def loaded(self) -> bool:
@@ -163,16 +220,17 @@ def _steam_widget_redirect_allowed(url: str, canonical_url: str) -> bool:
 
 
 def _steam_image_redirect_allowed(url: str, app_id: str) -> bool:
-    """Allow only one app's header image on an explicit Steam CDN host."""
+    """Allow only one app's named artwork on explicit Steam CDN hosts."""
 
-    if not isinstance(url, str) or len(url) > 2048:
+    if (not isinstance(url, str) or len(url) > 2048
+            or any(ord(char) <= 0x20 or ord(char) == 0x7f for char in url)):
         return False
     try:
         parsed = urlsplit(url)
         host = (parsed.hostname or "").lower()
         if (
             parsed.scheme.lower() != "https"
-            or host not in STEAM_CDN_HOSTS
+            or host not in STEAM_WIDGET_CDN_HOSTS
             or parsed.netloc.lower() != host
             or parsed.username is not None
             or parsed.password is not None
@@ -229,6 +287,8 @@ async def _call_fetch(
     *,
     allowed_url: Callable[[str], bool],
     max_bytes: int,
+    diagnostics: dict[str, object] | None = None,
+    provider: str | None = None,
 ) -> object | None:
     """Call safe_media while keeping provider redirects constrained."""
 
@@ -245,10 +305,15 @@ async def _call_fetch(
     if "allowed_url" not in parameters:
         return None
     kwargs: dict[str, object] = {"allowed_url": allowed_url}
-    if "max_bytes" in parameters or any(
+    accepts_kwargs = any(
         item.kind == inspect.Parameter.VAR_KEYWORD for item in parameters.values()
-    ):
+    )
+    if "max_bytes" in parameters or accepts_kwargs:
         kwargs["max_bytes"] = max_bytes
+    if diagnostics is not None and ("diagnostics" in parameters or accepts_kwargs):
+        kwargs["diagnostics"] = diagnostics
+    if provider is not None and ("provider" in parameters or accepts_kwargs):
+        kwargs["provider"] = provider
 
     try:
         call_result = method(url, **kwargs)
@@ -258,6 +323,8 @@ async def _call_fetch(
             call_result, timeout=STEAM_WIDGET_TIMEOUT_SECONDS
         )
     except Exception:
+        if diagnostics is not None:
+            diagnostics["reason"] = "request_failed"
         return None
 
 
@@ -288,19 +355,39 @@ def _first_text(
 
 
 def _steam_widget_fields(document: BeautifulSoup, app_id: str) -> dict[str, str]:
-    name = _first_text(
-        document,
-        (
-            ".game_name",
-            ".game_title",
-            "[itemprop='name']",
-            "meta[property='og:title']",
-        ),
-        240,
-    )
+    name = ""
+    # Current widgets use a purchase heading, not the store page's game_name.
+    # Validate its product link against this widget's AppID before trusting it.
+    for node in document.select(
+        "#widget .header_container .main_text a[href], "
+        "#widget #header h1:not(.tail) a[href], #widget h1.main_text a[href]"
+    ):
+        try:
+            target = urlsplit(str(node.get("href", "")))
+            same_app = (
+                target.scheme == "https"
+                and target.netloc == STEAM_STORE_HOST
+                and re.fullmatch(rf"/app/{re.escape(app_id)}/(?:[^/]+/)?", target.path)
+            )
+        except ValueError:
+            same_app = False
+        if same_app:
+            name = re.sub(
+                r"^(?:Buy\s+|购买\s*|購買\s*)", "", _plain_node_text(node, 260),
+                flags=re.IGNORECASE,
+            )[:240]
+            if name:
+                break
+    if not name:
+        name = _first_text(
+            document.select_one("#widget") or document,
+            (".game_name", ".game_title", "[itemprop='name']"),
+            240,
+        )
     description = _first_text(
         document,
         (
+            "#widget .desc",
             ".game_description_snippet",
             ".game_description",
             "#game_area_description .game_description_snippet",
@@ -311,14 +398,15 @@ def _steam_widget_fields(document: BeautifulSoup, app_id: str) -> dict[str, str]
     price = _first_text(
         document,
         (
-            ".game_purchase_price",
             ".discount_final_price",
+            ".game_purchase_price",
             ".game_purchase_action .price",
             ".game_area_purchase_game .price",
         ),
         120,
     )
     discount = _first_text(document, (".discount_pct",), 60)
+    original_price = _first_text(document, (".discount_original_price",), 120)
     if not discount:
         discount_block = document.select_one(".discount_block")
         block_text = _clean_text(
@@ -330,14 +418,16 @@ def _steam_widget_fields(document: BeautifulSoup, app_id: str) -> dict[str, str]
 
     image_url = ""
     for selector in (
+        "#widget img.capsule",
+        "link[rel='image_src']",
         ".game_header_image_ctn img",
         "img.game_header_image",
         ".game_header_image",
     ):
         for node in document.select(selector):
-            if node.name != "img":
+            if node.name not in {"img", "link"}:
                 continue
-            candidate = str(node.get("src", "")).strip()
+            candidate = str(node.get("href" if node.name == "link" else "src", "")).strip()
             if not candidate:
                 candidate = str(node.get("data-src", "")).strip()
             if _steam_image_redirect_allowed(candidate, app_id):
@@ -345,12 +435,18 @@ def _steam_widget_fields(document: BeautifulSoup, app_id: str) -> dict[str, str]
                 break
         if image_url:
             break
+    # Older metadata-based widgets must also identify this app's artwork;
+    # a generic document og:title alone is not evidence of a product.
+    if not name and image_url:
+        name = _first_text(document, ("meta[property='og:title']",), 240)
     return {
         "name": name,
         "description": description,
         "price": price,
+        "original_price": original_price,
         "discount": discount,
         "image_url": image_url,
+        "app_id": app_id,
     }
 
 
@@ -467,15 +563,26 @@ def _steam_card_html(
             f'<p class="keylol-steam-embed-description">{description}</p>'
         )
     price = html.escape(fields.get("price", ""), quote=True)
+    original_price = html.escape(fields.get("original_price", ""), quote=True)
     discount = html.escape(fields.get("discount", ""), quote=True)
     price_parts: list[str] = []
     if discount:
         price_parts.append(
             f'<span class="keylol-steam-embed-discount">{discount}</span>'
         )
+    prices = ""
+    if original_price:
+        prices += f'<del class="keylol-steam-embed-original-price">{original_price}</del>'
     if price:
+        prices += f'<strong class="keylol-steam-embed-price">{price}</strong>'
+    if prices:
+        price_parts.append(f'<span class="keylol-steam-embed-prices">{prices}</span>')
+    # Build the destination locally; never copy provider markup or arbitrary links.
+    app_id = fields.get("app_id", "")
+    if re.fullmatch(r"[0-9]{1,15}", app_id):
         price_parts.append(
-            f'<strong class="keylol-steam-embed-price">{price}</strong>'
+            f'<a class="keylol-steam-embed-buy" href="https://{STEAM_STORE_HOST}/app/{app_id}/" '
+            'rel="noopener noreferrer">在 Steam 上购买</a>'
         )
     if price_parts:
         details.append(
@@ -491,7 +598,10 @@ def _steam_card_html(
         '<article class="keylol-browser-media-card keylol-browser-steam-embed" '
         'data-keylol-embed-provider="steam" '
         'data-keylol-embed-status="success">'
-        f'{image}<div class="keylol-steam-embed-content"><strong>{name}</strong>'
+        '<div class="keylol-steam-embed-heading">'
+        f'<strong class="keylol-steam-embed-title">{name}</strong>'
+        '<span class="keylol-steam-embed-brand">STEAM</span></div>'
+        f'{image}<div class="keylol-steam-embed-content">'
         + "".join(details)
         + "</div></article>"
     )
@@ -522,15 +632,29 @@ async def render_embed(
         )
     if provider == "unknown":
         return EmbedRenderResult(
-            html=_fallback_html(None), status="fetch_fallback", provider=None
+            html=_fallback_html(None), status="fetch_fallback", provider=None,
+            reason="unsupported_provider",
         )
     canonical_url = normalize_steam_widget_url(url)
-    if not fetch or downloader is None:
+    app_id = _steam_app_id(canonical_url)
+    diagnostics: dict[str, object] = {}
+
+    def finish(reason: str, *, markup: str = "",
+               status: Literal["success", "provider_error", "fetch_fallback"] = "fetch_fallback",
+               partial: bool = False) -> EmbedRenderResult:
+        diagnostics["reason"] = reason
+        logger.debug("Steam widget app_id=%s status=%s diagnostics=%r",
+                     app_id, status, diagnostics)
         return EmbedRenderResult(
-            html=_fallback_html("steam"), status="fetch_fallback", provider="steam"
+            html=markup or _fallback_html("steam"), status=status, provider="steam",
+            partial=partial, reason=reason, diagnostics=diagnostics,
         )
 
-    app_id = _steam_app_id(canonical_url)
+    if not fetch or downloader is None:
+        return finish("fetch_disabled" if not fetch else "request_failed")
+
+    page_diagnostics: dict[str, object] = {}
+    diagnostics["request"] = page_diagnostics
     raw_page = await _call_fetch(
         downloader,
         "fetch_html",
@@ -539,49 +663,61 @@ async def render_embed(
             candidate, canonical_url
         ),
         max_bytes=STEAM_WIDGET_MAX_HTML_BYTES,
+        diagnostics=page_diagnostics,
+        provider="steam",
     )
+    if raw_page is None:
+        return finish(str(page_diagnostics.get("reason") or "request_failed"))
     page_result = _media_result_data(raw_page)
-    if (
-        page_result is None
-        or page_result[1] not in {"text/html", "application/xhtml+xml"}
-        or len(page_result[0]) > STEAM_WIDGET_MAX_HTML_BYTES
-        or (
-            page_result[2] is not None
-            and not _steam_widget_redirect_allowed(page_result[2], canonical_url)
-        )
+    if page_result is None:
+        return finish("body_rejected")
+    if page_result[2] is not None and not _steam_widget_redirect_allowed(
+        page_result[2], canonical_url
     ):
-        return EmbedRenderResult(
-            html=_fallback_html("steam"), status="fetch_fallback", provider="steam"
-        )
+        return finish("redirect_rejected")
+    response_status = _mapping_or_attr(raw_page, "status", "status_code")
+    if response_status is not None and response_status != 200:
+        return finish("http_status")
+    if page_result[1] not in {"text/html", "application/xhtml+xml"}:
+        return finish("content_type_rejected")
+    if not page_result[0] or len(page_result[0]) > STEAM_WIDGET_MAX_HTML_BYTES:
+        return finish("body_rejected")
 
     try:
         document = BeautifulSoup(page_result[0], "html.parser")
+        diagnostics["html_length"] = len(page_result[0])
+        diagnostics["title"] = _first_text(document, ("title",), 300)
+        diagnostics["root_nodes"] = [
+            {"tag": node.name, "id": _clean_text(node.get("id", ""), 80),
+             "class": _clean_text(" ".join(node.get("class", [])), 160)}
+            for node in document.select("#widget, #widget [id], #widget [class]")[:40]
+        ]
+        fields = _steam_widget_fields(document, app_id)
+        diagnostics["fields"] = fields
         provider_error = _steam_provider_error_fields(document)
         if provider_error is not None:
-            return EmbedRenderResult(
-                html=_steam_provider_error_card_html(provider_error),
+            return finish(
+                "provider_error", markup=_steam_provider_error_card_html(provider_error),
                 status="provider_error",
-                provider="steam",
             )
-        fields = _steam_widget_fields(document, app_id)
     except Exception:
-        return EmbedRenderResult(
-            html=_fallback_html("steam"), status="fetch_fallback", provider="steam"
-        )
+        return finish("body_rejected")
 
     # A Steam product title is needed to distinguish a parsed product widget
     # from an unrecognized/changed response. Artwork remains optional: the
     # existing partial-card path preserves safe product text when its image
     # cannot be fetched or validated.
     if not fields.get("name"):
-        return EmbedRenderResult(
-            html=_fallback_html("steam"), status="fetch_fallback", provider="steam"
-        )
+        return finish("parse_missing_title")
 
     image_data_uri = ""
     image_ok = False
     image_url = fields.get("image_url", "")
+    reason = "image_url_unrecognized"
     if image_url:
+        image_diagnostics: dict[str, object] = {}
+        diagnostics["image_request"] = image_diagnostics
+        reason = "image_fetch_failed"
         raw_image = await _call_fetch(
             downloader,
             "fetch_image",
@@ -590,6 +726,8 @@ async def render_embed(
                 candidate, app_id
             ),
             max_bytes=STEAM_WIDGET_MAX_IMAGE_BYTES,
+            diagnostics=image_diagnostics,
+            provider="steam",
         )
         image_result = _media_result_data(raw_image)
         if (
@@ -607,16 +745,12 @@ async def render_embed(
                 + base64.b64encode(image_result[0]).decode("ascii")
             )
             image_ok = True
+            reason = "success"
 
     # Missing price, description, or artwork can be a normal Steam product
     # state; metadata and the static card have still been parsed successfully.
     markup = _steam_card_html(fields, image_data_uri, partial=not image_ok)
-    return EmbedRenderResult(
-        html=markup,
-        status="success",
-        provider="steam",
-        partial=not image_ok,
-    )
+    return finish(reason, markup=markup, status="success", partial=not image_ok)
 
 
 __all__ = [
@@ -691,9 +825,15 @@ def _steam_video_app_id(value: str) -> str:
 def _keylol_video_poster_allowed(url: str, app_id: str) -> bool:
     """Only existing Steam app headers or static Keylol attachment images."""
 
-    if app_id and _steam_image_redirect_allowed(url, app_id):
-        return True
     parts = _strict_https_parts(url)
+    if app_id and parts is not None and len(url) <= 2048:
+        if (parts.hostname.lower() in STEAM_CDN_HOSTS
+                and (not parts.query or _CACHE_QUERY_RE.fullmatch(parts.query))
+                and re.fullmatch(
+            rf"/(?:store_item_assets/)?steam/apps/{re.escape(app_id)}/header\.jpg",
+            parts.path, re.IGNORECASE,
+        )):
+            return True
     return bool(
         parts is not None
         and parts.hostname.lower() in _KEYLOL_POSTER_HOSTS
